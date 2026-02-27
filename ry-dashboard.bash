@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# ry-dashboard v1.0.0 — 2026-02-20
-# System monitoring TUI for CachyOS on AMD Strix Halo (GTR9 Pro)
-# Pure bash + tput, zero external dependencies beyond coreutils + sysfs
+# ry-dashboard v1.1.0 — System monitoring TUI for CachyOS on Beelink GTR9 Pro (Strix Halo) | Ryan Musante | MIT | ./ry-dashboard.bash --help
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly PROG="${0##*/}"
 
 # ── Defaults ──────────────────────────────────────────────────────────────
@@ -119,7 +117,7 @@ System monitoring TUI for CachyOS / AMD Strix Halo
 
 Options:
   -i, --interval SEC   Refresh interval in seconds (default: 2, range: 1-10)
-  -p, --panel NUM      Start on panel 1-6, 0 for overview (default: 0)
+  -p, --panel NUM      Start on panel 0-6 (0 = overview, default: 0)
   -l, --log [PATH]     Enable CSV logging (default: \$XDG_DATA_HOME/ry-dashboard/)
       --json           Use JSONL format for logging
       --no-color       Disable color output
