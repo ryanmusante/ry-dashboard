@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
-# ry-dashboard v1.3.0 — CachyOS profile monitor for the Beelink GTR9 Pro (gfx1151)
+# ry-dashboard v1.4.0 — CachyOS profile monitor for the Beelink GTR9 Pro (gfx1151)
 set -euo pipefail
 
 # ── HEADER: VERSION + EXIT CODES ──
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 readonly PROG="${0##*/}"
 readonly EXIT_OK=0 EXIT_FAIL=1 EXIT_USAGE=2 EXIT_PREFLIGHT=3
 
 # ── PROFILE EXPECTATIONS (LOCKSTEP WITH THE ry-install PAIR) ──
-# Every value below is carried verbatim by ry-install.fish and ry-verify.fish.
-# Edit all three in lockstep or the readouts flag drift that is not there.
+# Every value below is carried by the pair — edit all three or readouts lie
 readonly PROFILE_VERSION="7.195.0"
 readonly EXPECT_SCALING_DRIVER="amd-pstate-epp"   # ry-verify EXPECTED_SCALING_DRIVER
 readonly EXPECT_GOVERNOR="performance"            # CPUPOWER_GOVERNOR
 readonly EXPECT_EPP="performance"                 # EPP_PREFERENCE
+readonly EXPECT_CPU_BOOST="on"                    # ry-verify asserts cpufreq/boost 1
 readonly EXPECT_GPU_DPM="high"                    # GPU_DPM_LEVEL
 readonly EXPECT_IO_SCHED="none"                   # 99-ry-perf.rules
 readonly EXPECT_WIFI_POWERSAVE="2"                # NM_WIFI_POWERSAVE
+readonly EXPECT_WIFI_PS_STATE="off"               # what iw reports under wifi.powersave=2
 readonly EXPECT_CPU_MATCH="Ryzen AI Max"          # EXPECTED_CPU_MATCH
 readonly BIOS_PPT_CEILING=85                      # flat SPL/fPPT/sPPT ceiling
 readonly BIOS_TJMAX=90                            # TjMax
@@ -38,8 +39,10 @@ FOCUSED_PANEL=0
 COLS=0
 ROWS=0
 NEED_REDRAW=1
+RENDER_ROW=0
 LAST_COLLECT_MS=0
 RUNNING=1
+TERM_STTY=""
 PROFILE_TICK=0
 readonly PROFILE_EVERY=5   # unit tally costs 16 systemctl calls, poll it sparsely
 
@@ -94,8 +97,10 @@ STOR_IO_READ=0
 STOR_IO_WRITE=0
 PREV_IO_READ=0
 PREV_IO_WRITE=0
+PREV_IO_TIME=0
 
 # ── SYSTEMD STATE ──
+SYS_PRESENT=0
 SYS_FAILED_COUNT=0
 SYS_FAILED_UNITS=""
 SYS_BOOT_TIME=""
@@ -112,7 +117,7 @@ THERM_CORE=0
 THERM_GPU=0
 THERM_EDGE=0
 THERM_FAN=0
-THERM_POWER_CORE=0
+THERM_POWER_GPU=0
 THERM_POWER_SOC=0
 THERM_TDP=0
 
@@ -179,12 +184,14 @@ Keybinds:
   q/Ctrl-C   Quit
 
 EXIT CODES: 0 ok · 1 runtime failure · 2 usage · 3 preflight
+  (signals exit 128+N: INT 130, TERM 143, HUP 129)
 
 ENVIRONMENT (see README.md for detail):
-  RY_INSTALL_SKIP_HARDWARE_CHECK=1  Bypass EXPECTED_CPU_MATCH hard-fail.
+  RY_INSTALL_SKIP_HARDWARE_CHECK=1  Bypass EXPECT_CPU_MATCH hard-fail.
   NO_COLOR              Disable colored output when set non-empty (no-color.org).
   XDG_DATA_HOME         Log directory root. Default ~/.local/share
 
+Log: \$XDG_DATA_HOME/ry-dashboard/YYYY-MM-DD-PID.csv (--json writes .jsonl)
 Profile baseline: ry-install $PROFILE_VERSION.
 EOF
     exit "$EXIT_OK"
@@ -196,8 +203,7 @@ parse_args() {
         case "$1" in
             -i|--interval)
                 [[ -n "${2:-}" ]] || die "$EXIT_USAGE" "--interval requires a value"
-                [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 10 )) \
-                    || die "$EXIT_USAGE" "--interval must be 1-10"
+                [[ "$2" =~ ^([1-9]|10)$ ]] || die "$EXIT_USAGE" "--interval must be 1-10"
                 INTERVAL="$2"
                 shift 2 ;;
             -p|--panel)
@@ -228,12 +234,10 @@ parse_args() {
 # ── HARDWARE GATE ──
 # Fail-closed on an unreadable model, exactly as the pair does
 hardware_gate() {
+    [[ "${RY_INSTALL_SKIP_HARDWARE_CHECK:-}" == "1" ]] && return 0
     [[ -n "$EXPECT_CPU_MATCH" ]] || return 0
     local model=""
     [[ -r /proc/cpuinfo ]] && model=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo)
-    if [[ "${RY_INSTALL_SKIP_HARDWARE_CHECK:-}" == "1" ]]; then
-        return 0
-    fi
     local lower_model="${model,,}" lower_match="${EXPECT_CPU_MATCH,,}"
     if [[ -z "$model" ]]; then
         err "$PROG: CPU model unreadable; expected a match for '$EXPECT_CPU_MATCH'"
@@ -250,19 +254,20 @@ hardware_gate() {
 preflight() {
     (( BASH_VERSINFO[0] >= 5 )) || die "$EXIT_PREFLIGHT" "bash 5 or newer required, found ${BASH_VERSION}"
     command -v tput >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "tput not found (install ncurses)"
-    # Query the capability without emitting it - a TERM without it cannot host the TUI
     [[ -t 0 ]] || die "$EXIT_PREFLIGHT" "stdin is not a terminal"
     [[ -t 1 ]] || die "$EXIT_PREFLIGHT" "stdout is not a terminal"
+    # Probe the capability without emitting it — a TERM without it cannot host the TUI
     tput smcup >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "TERM=${TERM:-unset} has no alternate screen"
-    hardware_gate
     update_term_size
     (( COLS >= 60 && ROWS >= 20 )) \
         || die "$EXIT_PREFLIGHT" "terminal too small (need 60x20, have ${COLS}x${ROWS})"
+    hardware_gate
     return 0
 }
 
 # ── TERMINAL SETUP + TEARDOWN ──
 term_setup() {
+    TERM_STTY=$(stty -g 2>/dev/null) || TERM_STTY=""
     tput smcup || die "$EXIT_FAIL" "cannot switch to the alternate screen"
     tput civis || true          # hide cursor
     stty -echo -icanon || die "$EXIT_FAIL" "cannot put the terminal in raw mode"
@@ -271,7 +276,11 @@ term_setup() {
 
 term_restore() {
     printf '\e[?7h'     # re-enable line wrap
-    stty echo icanon 2>/dev/null || true
+    if [[ -n "$TERM_STTY" ]]; then
+        stty "$TERM_STTY" 2>/dev/null || true
+    else
+        stty echo icanon 2>/dev/null || true
+    fi
     tput cnorm 2>/dev/null || true
     tput rmcup 2>/dev/null || true
 }
@@ -288,7 +297,8 @@ log_init() {
     (( LOG_ENABLED == 1 )) || return 0
     if [[ -z "$LOG_PATH" ]]; then
         local dir="${XDG_DATA_HOME:-$HOME/.local/share}/ry-dashboard"
-        mkdir -p "$dir" && chmod 0700 "$dir" || { err "$PROG: cannot create $dir"; LOG_ENABLED=0; return 0; }
+        mkdir -p "$dir" || { err "$PROG: cannot create $dir"; LOG_ENABLED=0; return 0; }
+        chmod 0700 "$dir" || { err "$PROG: cannot secure $dir"; LOG_ENABLED=0; return 0; }
         local ext="csv"
         (( LOG_JSON == 1 )) && ext="jsonl"
         LOG_PATH="$dir/$(date +%Y-%m-%d)-$$.$ext"
@@ -308,7 +318,7 @@ log_row() {
     local ts
     ts=$(date -Iseconds)
     if (( LOG_JSON == 1 )); then
-        printf '{"ts":"%s","cpu_freq":%s,"cpu_temp":%s,"cpu_load":%s,"gpu_sclk":%s,"gpu_temp":%s,"gpu_busy":%s,"gpu_power":%s,"net_rx":%s,"net_tx":%s,"root_pct":%s,"failed":%s,"pkg_temp":%s,"fan":%s,"tdp":%s}\n' \
+        printf '{"timestamp":"%s","cpu_freq_avg":%s,"cpu_temp":%s,"cpu_load":%s,"gpu_sclk":%s,"gpu_temp":%s,"gpu_busy":%s,"gpu_power":%s,"net_rx_rate":%s,"net_tx_rate":%s,"stor_root_pct":%s,"sys_failed":%s,"therm_package":%s,"therm_fan":%s,"therm_tdp":%s}\n' \
             "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "$(cpu_load_avg)" \
             "$GPU_SCLK" "$GPU_TEMP" "$GPU_BUSY" "$GPU_POWER" \
             "$NET_RX_RATE" "$NET_TX_RATE" "$STOR_ROOT_PCT" \
@@ -519,37 +529,40 @@ collect_wifi() {
     NET_WIFI_CHANNEL=""
     NET_POWERSAVE=""
     [[ -n "$NET_IFACE" ]] || return 0
+    local wline iw_out freq
+    local -a wfields
     if [[ -r /proc/net/wireless ]]; then
-        local wline
-        local -a wfields
-        wline=$(grep "^ *${NET_IFACE}:" /proc/net/wireless 2>/dev/null) || wline=""
-        if [[ -n "$wline" ]]; then
+        # Match the interface field-wise; a name with a dot is not a regex
+        while IFS= read -r wline; do
             read -ra wfields <<< "$wline"
+            [[ "${wfields[0]:-}" == "${NET_IFACE}:" ]] || continue
             NET_WIFI_SIGNAL="${wfields[3]%%.*}"   # dBm, strip the trailing dot
+            break
+        done < /proc/net/wireless
+    fi
+    if [[ -z "$NET_WIFI_SIGNAL" ]] || ! command -v iw >/dev/null 2>&1; then
+        return 0
+    fi
+    iw_out=$(iw dev "$NET_IFACE" info 2>/dev/null) || iw_out=""
+    if [[ -n "$iw_out" ]]; then
+        NET_WIFI_CHANNEL=$(awk '/channel/{for(i=1;i<=NF;i++) if($i=="channel"){print $(i+1); exit}}' <<< "$iw_out")
+        freq=$(sed -n 's/.*(\([0-9]\+\) MHz).*/\1/p' <<< "$iw_out" | head -n 1) || freq=""
+        if [[ -n "$freq" ]]; then
+            if (( freq < 3000 )); then NET_WIFI_BAND="2.4"
+            elif (( freq < 5900 )); then NET_WIFI_BAND="5"
+            else NET_WIFI_BAND="6"; fi
         fi
     fi
-    if [[ -n "$NET_WIFI_SIGNAL" ]] && command -v iw >/dev/null 2>&1; then
-        local iw_out
-        iw_out=$(iw dev "$NET_IFACE" info 2>/dev/null) || iw_out=""
-        if [[ -n "$iw_out" ]]; then
-            NET_WIFI_CHANNEL=$(awk '/channel/{for(i=1;i<=NF;i++) if($i=="channel"){print $(i+1); exit}}' <<< "$iw_out")
-            NET_POWERSAVE=$(awk '/power save/{print $NF; exit}' <<< "$iw_out")
-            local freq
-            freq=$(sed -n 's/.*(\([0-9]\+\) MHz).*/\1/p' <<< "$iw_out" | head -1) || freq=""
-            if [[ -n "$freq" ]]; then
-                if (( freq < 3000 )); then NET_WIFI_BAND="2.4"
-                elif (( freq < 5900 )); then NET_WIFI_BAND="5"
-                else NET_WIFI_BAND="6"; fi
-            fi
-        fi
-    fi
+    # iw prints power save only from get power_save, and with a capital P
+    NET_POWERSAVE=$(iw dev "$NET_IFACE" get power_save 2>/dev/null \
+        | awk -F': ' '/[Pp]ower save:/{print $2; exit}') || NET_POWERSAVE=""
     return 0
 }
 
 collect_storage() {
     local df_out
     local -a df_fields
-    df_out=$(df -B1 --output=size,used,pcent / 2>/dev/null | tail -1) || df_out=""
+    df_out=$(df -B1 --output=size,used,pcent / 2>/dev/null | tail -n 1) || df_out=""
     if [[ -n "$df_out" ]]; then
         read -ra df_fields <<< "$df_out"
         STOR_ROOT_TOTAL=$(( df_fields[0] / 1073741824 ))   # bytes -> GiB
@@ -593,38 +606,44 @@ collect_storage() {
 }
 
 collect_storage_io() {
-    if [[ -n "$STOR_DISK" && -r /proc/diskstats ]]; then
-        local ds_line
-        local -a ds
-        ds_line=$(awk -v d="$STOR_DISK" '$3 == d {print; exit}' /proc/diskstats 2>/dev/null) || ds_line=""
-        if [[ -n "$ds_line" ]]; then
-            read -ra ds <<< "$ds_line"
-            local cur_read=$(( ds[5] * 512 ))    # sectors read
-            local cur_write=$(( ds[9] * 512 ))   # sectors written
-            if (( PREV_IO_READ > 0 )); then
-                local d_read=$((cur_read - PREV_IO_READ))
-                local d_write=$((cur_write - PREV_IO_WRITE))
-                (( d_read < 0 )) && d_read=0
-                (( d_write < 0 )) && d_write=0
-                STOR_IO_READ=$((d_read / INTERVAL / 1048576))     # MB/s
-                STOR_IO_WRITE=$((d_write / INTERVAL / 1048576))
-            fi
-            PREV_IO_READ=$cur_read
-            PREV_IO_WRITE=$cur_write
+    [[ -n "$STOR_DISK" && -r /proc/diskstats ]] || return 0
+    local ds_line now dt cur_read cur_write d_read d_write
+    local -a ds
+    ds_line=$(awk -v d="$STOR_DISK" '$3 == d {print; exit}' /proc/diskstats 2>/dev/null) || ds_line=""
+    [[ -n "$ds_line" ]] || return 0
+    read -ra ds <<< "$ds_line"
+    now=$(( $(date +%s%N) / 1000000 ))
+    cur_read=$(( ds[5] * 512 ))    # sectors read
+    cur_write=$(( ds[9] * 512 ))   # sectors written
+    # Rate off the measured window, not INTERVAL — r and +/- move the cadence
+    if (( PREV_IO_TIME > 0 )); then
+        dt=$((now - PREV_IO_TIME))
+        if (( dt > 0 )); then
+            d_read=$((cur_read - PREV_IO_READ))
+            d_write=$((cur_write - PREV_IO_WRITE))
+            (( d_read < 0 )) && d_read=0
+            (( d_write < 0 )) && d_write=0
+            STOR_IO_READ=$(( d_read * 1000 / dt / 1048576 ))     # MB/s
+            STOR_IO_WRITE=$(( d_write * 1000 / dt / 1048576 ))
         fi
     fi
+    PREV_IO_READ=$cur_read
+    PREV_IO_WRITE=$cur_write
+    PREV_IO_TIME=$now
     return 0
 }
 
 collect_systemd() {
+    SYS_PRESENT=0
     command -v systemctl >/dev/null 2>&1 || return 0
+    SYS_PRESENT=1
     local failed_out
     SYS_FAILED_UNITS=""
     SYS_FAILED_COUNT=0
     failed_out=$(systemctl --failed --no-legend --plain 2>/dev/null) || failed_out=""
     if [[ -n "$failed_out" ]]; then
         SYS_FAILED_COUNT=$(wc -l <<< "$failed_out")
-        SYS_FAILED_UNITS=$(awk '{print $1}' <<< "$failed_out" | head -10)
+        SYS_FAILED_UNITS=$(awk 'NR<=10{print $1}' <<< "$failed_out")
     fi
 
     SYS_BOOT_TIME=$(systemd-analyze 2>/dev/null | awk -F'= ' 'NR==1{print $2; exit}') || SYS_BOOT_TIME=""
@@ -638,7 +657,7 @@ collect_systemd() {
 
     SYS_JOURNAL_ERRORS=""
     if command -v journalctl >/dev/null 2>&1; then
-        SYS_JOURNAL_ERRORS=$(journalctl -p err --since "5 min ago" --no-pager -q -o short-monotonic 2>/dev/null | tail -5) || SYS_JOURNAL_ERRORS=""
+        SYS_JOURNAL_ERRORS=$(journalctl -p err --since "5 min ago" --no-pager -q -o short-monotonic 2>/dev/null | tail -n 5) || SYS_JOURNAL_ERRORS=""
     fi
     return 0
 }
@@ -650,7 +669,7 @@ collect_profile_units() {
     SYS_SVC_BAD=""
     for unit in "${EXPECT_SERVICES[@]}"; do
         state=$(systemctl is-active "$unit" 2>/dev/null) || true
-        if [[ "$state" == "active" || "$state" == "waiting" ]]; then
+        if [[ "$state" == "active" ]]; then
             SYS_SVC_OK=$((SYS_SVC_OK + 1))
         else
             SYS_SVC_BAD+="${SYS_SVC_BAD:+$'\n'}$unit (${state:-unknown})"
@@ -678,7 +697,7 @@ collect_thermal() {
         [[ -r "$HWMON_AMDGPU/temp1_input" ]] && THERM_EDGE=$(( $(< "$HWMON_AMDGPU/temp1_input") / 1000 ))
         [[ -r "$HWMON_AMDGPU/temp2_input" ]] && THERM_GPU=$(( $(< "$HWMON_AMDGPU/temp2_input") / 1000 ))
         THERM_FAN=$(read_sysfs "$HWMON_AMDGPU/fan1_input" 0)
-        [[ -r "$HWMON_AMDGPU/power1_average" ]] && THERM_POWER_CORE=$(( $(read_sysfs "$HWMON_AMDGPU/power1_average" 0) / 1000000 ))
+        [[ -r "$HWMON_AMDGPU/power1_average" ]] && THERM_POWER_GPU=$(( $(read_sysfs "$HWMON_AMDGPU/power1_average" 0) / 1000000 ))
         [[ -r "$HWMON_AMDGPU/power2_average" ]] && THERM_POWER_SOC=$(( $(read_sysfs "$HWMON_AMDGPU/power2_average" 0) / 1000000 ))
         [[ -r "$HWMON_AMDGPU/power1_cap" ]] && THERM_TDP=$(( $(read_sysfs "$HWMON_AMDGPU/power1_cap" 0) / 1000000 ))
     fi
@@ -748,10 +767,11 @@ render_panel_header() {
     local title_len=${#title}
     local remain=$((width - title_len))
     if (( remain > 1 )); then
+        # tr would truncate the box-drawing byte string to its first byte
+        local pad
+        printf -v pad '%*s' "$((remain - 1))" ''
         goto "$row" $((col + title_len + 1))
-        printf '%s' "$C_DIM"
-        printf '%*s' "$((remain - 1))" '' | tr ' ' '─'
-        printf '%s' "$C_RESET"
+        printf '%s%s%s' "$C_DIM" "${pad// /─}" "$C_RESET"
     fi
     return 0
 }
@@ -830,6 +850,10 @@ render_storage_panel() {
 render_systemd_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "SYSTEMD"
+    if (( SYS_PRESENT == 0 )); then
+        put $((r+1)) "$c" "$C_DIM" "systemctl not available"
+        return 0
+    fi
     local fail_color="$C_GREEN"
     (( SYS_FAILED_COUNT > 0 )) && fail_color="$C_RED"
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Failed: %s%d%s       Boot: %s' "$fail_color" "$SYS_FAILED_COUNT" "$C_RESET" "${SYS_BOOT_TIME:-?}")"
@@ -857,7 +881,7 @@ render_thermal_panel() {
     tdp_color=$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Package: %s%3d°C%s   Fan: %d RPM' "$pkg_color" "$THERM_PACKAGE" "$C_RESET" "$THERM_FAN")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf 'Core: %3d°C      SoC: %3dW' "$THERM_CORE" "$THERM_POWER_SOC")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Edge: %3d°C      GPU: %3dW  TDP: %s%dW%s/%dW' "$THERM_EDGE" "$THERM_POWER_CORE" "$tdp_color" "$THERM_TDP" "$C_RESET" "$BIOS_PPT_CEILING")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Edge: %3d°C      GPU: %3dW  TDP: %s%dW%s/%dW' "$THERM_EDGE" "$THERM_POWER_GPU" "$tdp_color" "$THERM_TDP" "$C_RESET" "$BIOS_PPT_CEILING")"
     return 0
 }
 
@@ -866,7 +890,7 @@ render_cpu_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "CPU — Detailed"
     local row=$((r+1)) i
-    put "$row" 2 "$C_WHITE" "$(printf 'Average:  %d MHz   Boost: %s   Cores: %d' "$CPU_FREQ_AVG" "$CPU_BOOST" "$CPU_CORES")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Average:  %d MHz   Boost: %s%s%s   Cores: %d' "$CPU_FREQ_AVG" "$(color_expect "$CPU_BOOST" "$EXPECT_CPU_BOOST")" "$CPU_BOOST" "$C_RESET" "$CPU_CORES")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'Driver:   %s%-16s%s expected %s' "$(color_expect "$CPU_DRIVER" "$EXPECT_SCALING_DRIVER")" "$CPU_DRIVER" "$C_RESET" "$EXPECT_SCALING_DRIVER")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'Governor: %s%-16s%s expected %s' "$(color_expect "$CPU_GOVERNOR" "$EXPECT_GOVERNOR")" "$CPU_GOVERNOR" "$C_RESET" "$EXPECT_GOVERNOR")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'EPP:      %s%-16s%s expected %s' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$EXPECT_EPP")"; row=$((row+1))
@@ -940,7 +964,7 @@ render_network_expanded() {
         put "$row" 2 "$C_WHITE" "$(printf 'Signal:     %s dBm' "$NET_WIFI_SIGNAL")"; row=$((row+1))
         put "$row" 2 "$C_WHITE" "$(printf 'Band:       %s GHz' "${NET_WIFI_BAND:-?}")"; row=$((row+1))
         put "$row" 2 "$C_WHITE" "$(printf 'Channel:    %s' "${NET_WIFI_CHANNEL:-?}")"; row=$((row+1))
-        put "$row" 2 "$C_WHITE" "$(printf 'Power save: %s%s%s (NM_WIFI_POWERSAVE %s = off)' "$(color_expect "${NET_POWERSAVE:-?}" off)" "${NET_POWERSAVE:-?}" "$C_RESET" "$EXPECT_WIFI_POWERSAVE")"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "$(printf 'Power save: %s%s%s (NM_WIFI_POWERSAVE %s = %s)' "$(color_expect "${NET_POWERSAVE:-?}" "$EXPECT_WIFI_PS_STATE")" "${NET_POWERSAVE:-?}" "$C_RESET" "$EXPECT_WIFI_POWERSAVE" "$EXPECT_WIFI_PS_STATE")"; row=$((row+1))
     fi
     if (( DETAIL_LEVEL == 1 )); then
         row=$((row+1))
@@ -988,10 +1012,30 @@ render_storage_expanded() {
     return 0
 }
 
+# Print one unit per row up to limit; the stop row comes back in RENDER_ROW,
+# never a command substitution — put writes escapes to stdout
+render_unit_list() {
+    local row=$1 w=$2 limit=$3 color=$4 units=$5 unit
+    if [[ -n "$units" ]]; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            (( row >= limit )) && break
+            put "$row" 4 "$color" "${unit:0:$((w-6))}"
+            row=$((row+1))
+        done <<< "$units"
+    fi
+    RENDER_ROW=$row
+    return 0
+}
+
 render_systemd_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "SYSTEMD — Detailed"
-    local row=$((r+1)) unit eline
+    local row=$((r+1))
+    if (( SYS_PRESENT == 0 )); then
+        put "$row" 2 "$C_DIM" "systemctl not available — the profile tally needs it"
+        return 0
+    fi
     local fail_color="$C_GREEN"
     (( SYS_FAILED_COUNT > 0 )) && fail_color="$C_RED"
     put "$row" 2 "$C_WHITE" "$(printf 'Failed Units:  %s%d%s' "$fail_color" "$SYS_FAILED_COUNT" "$C_RESET")"; row=$((row+1))
@@ -1000,38 +1044,18 @@ render_systemd_expanded() {
     row=$((row+1))
     put "$row" 2 "$C_BOLD" "$(printf 'Profile Units (ry-install %s)' "$PROFILE_VERSION")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'Enabled: %s%d/%d active%s' "$(color_count "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}")" "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}" "$C_RESET")"; row=$((row+1))
-    while IFS= read -r unit; do
-        [[ -n "$unit" ]] || continue
-        (( row >= max_h - 4 )) && break
-        put "$row" 4 "$C_YELLOW" "$unit"
-        row=$((row+1))
-    done <<< "$SYS_SVC_BAD"
+    render_unit_list "$row" "$w" $((max_h - 4)) "$C_YELLOW" "$SYS_SVC_BAD"; row=$RENDER_ROW
     put "$row" 2 "$C_WHITE" "$(printf 'Masked:  %s%d/%d masked%s' "$(color_count "$SYS_MASK_OK" "${#EXPECT_MASK[@]}")" "$SYS_MASK_OK" "${#EXPECT_MASK[@]}" "$C_RESET")"; row=$((row+1))
-    while IFS= read -r unit; do
-        [[ -n "$unit" ]] || continue
-        (( row >= max_h - 3 )) && break
-        put "$row" 4 "$C_YELLOW" "$unit"
-        row=$((row+1))
-    done <<< "$SYS_MASK_BAD"
+    render_unit_list "$row" "$w" $((max_h - 3)) "$C_YELLOW" "$SYS_MASK_BAD"; row=$RENDER_ROW
     if (( SYS_FAILED_COUNT > 0 )); then
         row=$((row+1))
         put "$row" 2 "${C_BOLD}${C_RED}" "Failed"; row=$((row+1))
-        while IFS= read -r unit; do
-            [[ -n "$unit" ]] || continue
-            (( row >= max_h - 2 )) && break
-            put "$row" 4 "$C_RED" "$unit"
-            row=$((row+1))
-        done <<< "$SYS_FAILED_UNITS"
+        render_unit_list "$row" "$w" $((max_h - 2)) "$C_RED" "$SYS_FAILED_UNITS"; row=$RENDER_ROW
     fi
     if (( DETAIL_LEVEL == 1 )) && [[ -n "$SYS_JOURNAL_ERRORS" ]]; then
         row=$((row+1))
         put "$row" 2 "${C_BOLD}${C_YELLOW}" "Recent Errors (5 min)"; row=$((row+1))
-        while IFS= read -r eline; do
-            [[ -n "$eline" ]] || continue
-            (( row >= max_h - 2 )) && break
-            put "$row" 4 "$C_YELLOW" "${eline:0:$((w-6))}"
-            row=$((row+1))
-        done <<< "$SYS_JOURNAL_ERRORS"
+        render_unit_list "$row" "$w" $((max_h - 2)) "$C_YELLOW" "$SYS_JOURNAL_ERRORS"; row=$RENDER_ROW
     fi
     return 0
 }
@@ -1048,7 +1072,7 @@ render_thermal_expanded() {
     put "$row" 2 "$C_DIM" "$(printf 'BIOS TjMax:     %3d°C' "$BIOS_TJMAX")"; row=$((row+1))
     row=$((row+1))
     put "$row" 2 "$C_BOLD" "Power"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Core Power:     %3d W' "$THERM_POWER_CORE")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'GPU Power:      %3d W' "$THERM_POWER_GPU")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'SoC Power:      %3d W' "$THERM_POWER_SOC")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'TDP Cap:        %s%3d W%s' "$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))" "$THERM_TDP" "$C_RESET")"; row=$((row+1))
     put "$row" 2 "$C_DIM" "$(printf 'BIOS ceiling:   %3d W flat SPL/fPPT/sPPT' "$BIOS_PPT_CEILING")"; row=$((row+1))
@@ -1077,7 +1101,9 @@ render_header() {
     printf '%s' "${C_BOLD}${C_BG_BLUE}${C_WHITE}"
     printf ' ry-dashboard v%s' "$VERSION"
     local panels=("OVR" "CPU" "GPU" "NET" "DISK" "SYS" "THERM")
+    local used=$(( 15 + ${#VERSION} ))   # width of the title run above
     for ((i = 0; i < ${#panels[@]}; i++)); do
+        used=$(( used + ${#panels[$i]} + 3 ))   # both arms print 3 + label
         if (( i == FOCUSED_PANEL )); then
             printf ' %s[%s]%s%s' "$C_BOLD" "${panels[$i]}" "$C_RESET" "${C_BG_BLUE}${C_WHITE}"
         else
@@ -1085,7 +1111,8 @@ render_header() {
         fi
     done
     local right_str="$now "
-    local pad_width=$((COLS - ${#right_str} - 5 - ${#panels[@]} * 7 - 25))
+    (( LOG_ENABLED == 1 )) && used=$((used + 5))   # the ●REC indicator
+    local pad_width=$((COLS - used - ${#right_str}))
     (( pad_width > 0 )) && printf '%*s' "$pad_width" ""
     printf '%s%s' "$right_str" "$C_RESET"
     printf '%s' "$log_ind"
@@ -1106,7 +1133,9 @@ render_statusbar() {
     printf '%s' "$C_BOLD"
     local load_avg fail_ind
     load_avg=$(cpu_load_avg)
-    if (( SYS_FAILED_COUNT > 0 )); then
+    if (( SYS_PRESENT == 0 )); then
+        fail_ind="${C_DIM}?${C_RESET}${C_BOLD}"
+    elif (( SYS_FAILED_COUNT > 0 )); then
         fail_ind="${C_RED}${SYS_FAILED_COUNT}!${C_RESET}${C_BOLD}"
     else
         fail_ind="${C_GREEN}0${C_RESET}${C_BOLD}"
@@ -1121,9 +1150,13 @@ render_statusbar() {
         "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "${C_RESET}${C_BOLD}"
     printf '  NET:↓%s ↑%s' "$(fmt_rate "$NET_RX_RATE")" "$(fmt_rate "$NET_TX_RATE")"
     printf '  SYS:%s' "$fail_ind"
-    printf '  PRF:%s%d/%d%s' \
-        "$(color_count $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )))" \
-        $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )) "${C_RESET}${C_BOLD}"
+    if (( SYS_PRESENT == 1 )); then
+        printf '  PRF:%s%d/%d%s' \
+            "$(color_count $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )))" \
+            $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )) "${C_RESET}${C_BOLD}"
+    else
+        printf '  PRF:%s?%s' "$C_DIM" "${C_RESET}${C_BOLD}"
+    fi
     printf '  T:%s%d°C%s' "$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$THERM_PACKAGE" "${C_RESET}${C_BOLD}"
     printf '\e[K%s' "$C_RESET"
     return 0
@@ -1221,6 +1254,15 @@ cleanup() {
     exit "$status"
 }
 
+# Signals exit 128+N, the domain ry-install and ry-verify certify
+on_signal() {
+    local signo=$1
+    RUNNING=0
+    trap - EXIT
+    term_restore
+    exit $((128 + signo))
+}
+
 # ── MAIN ──
 main() {
     parse_args "$@"
@@ -1229,7 +1271,10 @@ main() {
     discover_hardware
     FOCUSED_PANEL=$START_PANEL
 
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    trap 'on_signal 1' HUP
+    trap 'on_signal 2' INT
+    trap 'on_signal 15' TERM
     trap update_term_size WINCH
 
     term_setup

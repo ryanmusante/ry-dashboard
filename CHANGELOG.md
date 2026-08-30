@@ -3,6 +3,44 @@ Changes for ry-dashboard
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+1.4.0
+-----
+
+  - fix: the panel rule emitted one raw 0xE2 byte per column, tr having
+    truncated the box-drawing replacement to its first byte
+  - fix: the Wi-Fi power-save readout parsed iw dev info, which never
+    prints it; read iw dev get power_save and match its capital P
+  - fix: --interval 011 parsed as octal 9 and passed the range test, and
+    --interval 08 leaked a bash arithmetic error; match 1-10 literally
+  - fix: INT, TERM, and HUP now exit 130, 143, and 129 rather than 0, and
+    HUP no longer leaves the alternate screen up
+  - fix: an absent systemctl reported 0/5 active and 0/11 masked in red
+    rather than blanking the panel
+  - fix: the failed-unit list was the one unguarded pipeline under
+    pipefail; slice to ten rows inside awk instead
+  - cpu: color the boost readout against the 1 ry-verify asserts
+  - storage: rate the IO counters off the measured window, as the network
+    rates already do, not off the configured interval
+  - terminal: save stty -g at setup and restore it verbatim rather than
+    forcing echo and icanon back on
+  - logging: key the JSONL rows by the CSV column names
+  - profile: name the iw power-save state the profile implies as its own
+    expectation instead of a literal in the renderer
+  - preflight: run the terminal-size gate before the hardware gate, the
+    order README.md documents
+  - preflight: read the CPU model only when the skip variable is unset
+  - thermal: THERM_POWER_CORE holds amdgpu power1_average, so rename it
+    THERM_POWER_GPU and label it alike in both panels
+  - header: derive the clock padding from the widths actually printed,
+    which left it 14 columns short of the right edge
+  - help: name EXPECT_CPU_MATCH, the gate this script declares, and print
+    the signal line and log path beside the exit codes
+  - cleanty: head -1, tail -1, head -10, and tail -5 take -n; drop the
+    grep dependency by matching /proc/net/wireless field-wise
+  - readme: ip and the util-linux tools, the GPU is discovered and not
+    gated, signal exits, and the JSONL keying
+
+
 1.3.0
 -----
 

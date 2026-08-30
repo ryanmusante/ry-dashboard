@@ -1,6 +1,6 @@
 # ry-dashboard
 
-**Version 1.3.0** · [Changelog](CHANGELOG.md)
+**Version 1.4.0** · [Changelog](CHANGELOG.md)
 
 Read-only terminal monitor for the CachyOS profile [ry-install](https://github.com/ryanmusante/ry-install) deploys on the Beelink GTR9 Pro (Ryzen AI Max+ 395 / gfx1151 / Strix Halo). `ry-dashboard.bash` reads sysfs, `/proc`, and `systemctl` on a timer and paints six panels, coloring each live value against the tunable [ry-install](https://github.com/ryanmusante/ry-install) actually deploys — a glance at profile state between runs, not a substitute for [ry-verify](https://github.com/ryanmusante/ry-verify), which is the audit.
 
@@ -27,11 +27,11 @@ The overview grid opens on launch; `1`-`6` expand a panel and `q` quits — see 
 | OS | Linux with sysfs; CachyOS with the [ry-install](https://github.com/ryanmusante/ry-install) profile deployed |
 | Shell | bash 5.0 or newer |
 | Terminal | at least 60x20, `TERM` with an alternate screen (`smcup`) |
-| Hardware | CPU matching `Ryzen AI Max` — bypass via [Environment Overrides](#environment-overrides); AMD GPU by vendor ID `0x1002` |
+| Hardware | CPU matching `Ryzen AI Max` — bypass via [Environment Overrides](#environment-overrides) |
 | Privileges | normal user; no `sudo`, no writes outside the log directory |
-| Tools | GNU coreutils, `tput` (ncurses), `stty`, `findmnt`, `awk`, `sed`, `df` |
+| Tools | GNU coreutils (`stty`, `df`, `nproc`, `date`), `tput` (ncurses), `findmnt` (util-linux), `ip` (iproute2), `awk`, `sed` |
 
-Optional and degraded gracefully when absent: `systemctl` and `journalctl` blank the Systemd panel, `iw` drops the Wi-Fi band, channel, and power-save readouts, and a missing GPU blanks the GPU panel.
+Optional and degraded gracefully when absent: `systemctl` and `systemd-analyze` blank the Systemd panel, `journalctl` drops the recent-errors block, `iw` drops the Wi-Fi band, channel, and power-save readouts, `ip` blanks the IP address, and a missing GPU blanks the GPU panel. The GPU is discovered, not gated — an absent one is not a preflight failure.
 
 ## Usage
 
@@ -44,7 +44,7 @@ The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` 
 | `-l, --log [PATH]` | enable logging; bare form uses the default path |
 | `--json` | log JSONL instead of CSV |
 | `--no-color` | disable colored output |
-| `-v, --version` | print `v1.3.0` and exit |
+| `-v, --version` | print `v1.4.0` and exit |
 | `-h, --help` | print help and exit |
 
 ## Exit Codes
@@ -57,6 +57,8 @@ The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` 
 | `1` | a runtime failure; the terminal could not be taken over |
 | `2` | bad arguments, a positional argument, an out-of-range value |
 | `3` | preflight — old bash, missing `tput`, no tty, no alternate screen, terminal below 60x20, CPU gate mismatch |
+
+`INT`, `TERM`, and `HUP` exit `128+N` — `130`, `143`, and `129` — the signal convention `ry-install.fish` and `ry-verify.fish` certify.
 
 ## Environment Overrides
 
@@ -73,9 +75,9 @@ Six panels, two per row in the overview grid, each expandable. `d` toggles the d
 
 | Panel | Sources | Profile readouts |
 |---|---|---|
-| CPU | `/proc/stat`, `cpufreq`, `k10temp` | scaling driver, governor, EPP |
+| CPU | `/proc/stat`, `cpufreq`, `k10temp` | scaling driver, governor, EPP, boost |
 | GPU | `/sys/class/drm/card*/device/`, `amdgpu` hwmon | DPM level |
-| Network | `/sys/class/net/*/statistics/`, `/proc/net/wireless`, `iw` | Wi-Fi power save |
+| Network | `/sys/class/net/*/statistics/`, `/proc/net/wireless`, `ip`, `iw` | Wi-Fi power save |
 | Storage | `df`, `findmnt`, `/proc/diskstats`, `/sys/block/*/queue/` | fstab options, NVMe scheduler |
 | Systemd | `systemctl`, `systemd-analyze`, `journalctl` | enabled and masked unit tallies, refreshed every 5th tick |
 | Thermal | `k10temp` and `amdgpu` hwmon | TjMax and PPT ceiling headroom |
@@ -106,9 +108,10 @@ A green readout means the live value equals what [ry-install](https://github.com
 | `EXPECT_SCALING_DRIVER` | ry-verify | `EXPECTED_SCALING_DRIVER` | `amd-pstate-epp` |
 | `EXPECT_GOVERNOR` | both | `CPUPOWER_GOVERNOR` | `performance` |
 | `EXPECT_EPP` | both | `EPP_PREFERENCE` | `performance` |
+| `EXPECT_CPU_BOOST` | ry-verify | `cpufreq/boost` | `on` (sysfs `1`) |
 | `EXPECT_GPU_DPM` | both | `GPU_DPM_LEVEL` | `high` |
 | `EXPECT_IO_SCHED` | both | `99-ry-perf.rules` | `none` |
-| `EXPECT_WIFI_POWERSAVE` | both | `NM_WIFI_POWERSAVE` | `2` (disabled) |
+| `EXPECT_WIFI_POWERSAVE` | both | `NM_WIFI_POWERSAVE` | `2`, which `iw` reports as `off` |
 | `EXPECT_FSTAB_OPTS` | both | fstab rewrite | `noatime`, `lazytime`, `commit=10` |
 | `EXPECT_SERVICES` | both | `EXPECTED_SERVICES` | 5 units expected active |
 | `EXPECT_MASK` | both | `MASK` | 11 units expected masked |
@@ -127,7 +130,7 @@ Logging is off by default. `--log` writes one row per refresh tick; `l` toggles 
 | Path | `$XDG_DATA_HOME/ry-dashboard/YYYY-MM-DD-PID.csv` |
 | Mode | `0600`, written under `umask 0177`; the directory is `0700` |
 | CSV columns | `timestamp,cpu_freq_avg,cpu_temp,cpu_load,gpu_sclk,gpu_temp,gpu_busy,gpu_power,net_rx_rate,net_tx_rate,stor_root_pct,sys_failed,therm_package,therm_fan,therm_tdp` |
-| JSONL | the same fields as one object per line, via `--json` |
+| JSONL | one object per line keyed by the CSV column names, via `--json` |
 
 The PID in the filename keeps two concurrent instances from interleaving rows into one file.
 
@@ -135,9 +138,9 @@ The PID in the filename keeps two concurrent instances from interleaving rows in
 
 **Read-only** — the dashboard opens sysfs and `/proc` for reading, calls `systemctl` only in query subcommands, and writes nothing but its own log file.
 
-**Terminal restore** — `tput smcup` takes the alternate screen and the `EXIT`, `INT`, and `TERM` traps restore the screen, cursor, line wrap, and cooked input on every path, including a failed preflight.
+**Terminal restore** — `tput smcup` takes the alternate screen and the `EXIT`, `INT`, `TERM`, and `HUP` traps restore the screen, cursor, line wrap, and the `stty` settings saved at setup. Preflight probes the alternate screen without emitting it, so a failed gate leaves the terminal untouched and needs no restore.
 
-**Exit status** — the `EXIT` trap preserves the status the script is exiting with rather than forcing `0`, so a wrapper script can branch on it.
+**Exit status** — the `EXIT` trap preserves the status the script is exiting with rather than forcing `0`, and a signal exits `128+N`, so a wrapper script can tell a clean quit from an interrupt.
 
 **Graceful degradation** — a missing GPU, `iw`, `systemctl`, or `journalctl` blanks the affected readout instead of failing the run.
 
