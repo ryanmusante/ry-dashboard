@@ -1,40 +1,63 @@
 #!/usr/bin/env bash
-# ry-dashboard v1.1.0 — System monitoring TUI for CachyOS on Beelink GTR9 Pro (Strix Halo) | Ryan Musante | MIT | ./ry-dashboard.bash --help
+# ry-dashboard v1.3.0 — CachyOS profile monitor for the Beelink GTR9 Pro (gfx1151)
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+# ── HEADER: VERSION + EXIT CODES ──
+readonly VERSION="1.3.0"
 readonly PROG="${0##*/}"
+readonly EXIT_OK=0 EXIT_FAIL=1 EXIT_USAGE=2 EXIT_PREFLIGHT=3
 
-# ── Defaults ──────────────────────────────────────────────────────────────
+# ── PROFILE EXPECTATIONS (LOCKSTEP WITH THE ry-install PAIR) ──
+# Every value below is carried verbatim by ry-install.fish and ry-verify.fish.
+# Edit all three in lockstep or the readouts flag drift that is not there.
+readonly PROFILE_VERSION="7.195.0"
+readonly EXPECT_SCALING_DRIVER="amd-pstate-epp"   # ry-verify EXPECTED_SCALING_DRIVER
+readonly EXPECT_GOVERNOR="performance"            # CPUPOWER_GOVERNOR
+readonly EXPECT_EPP="performance"                 # EPP_PREFERENCE
+readonly EXPECT_GPU_DPM="high"                    # GPU_DPM_LEVEL
+readonly EXPECT_IO_SCHED="none"                   # 99-ry-perf.rules
+readonly EXPECT_WIFI_POWERSAVE="2"                # NM_WIFI_POWERSAVE
+readonly EXPECT_CPU_MATCH="Ryzen AI Max"          # EXPECTED_CPU_MATCH
+readonly BIOS_PPT_CEILING=85                      # flat SPL/fPPT/sPPT ceiling
+readonly BIOS_TJMAX=90                            # TjMax
+readonly -a EXPECT_FSTAB_OPTS=(noatime lazytime commit=10)
+readonly -a EXPECT_SERVICES=(fstrim.timer NetworkManager.service cpupower.service nftables.service bluetooth.service)
+readonly -a EXPECT_MASK=(ananicy-cpp.service power-profiles-daemon.service NetworkManager-wait-online.service avahi-daemon.service avahi-daemon.socket ufw.service sleep.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target)
+
+# ── DEFAULTS ──
 INTERVAL=2
-START_PANEL=0           # 0 = overview grid, 1-6 = expanded panel
+START_PANEL=0           # 0 = overview grid, 1-6 = expanded
 LOG_ENABLED=0
 LOG_PATH=""
 LOG_JSON=0
 USE_COLOR=1
-DETAIL_LEVEL=0          # 0 = compact, 1 = detailed (within expanded panel)
+DETAIL_LEVEL=0          # 0 = compact, 1 = detailed within an expanded panel
 
-# ── State ─────────────────────────────────────────────────────────────────
-FOCUSED_PANEL=0         # 0 = overview, 1-6 = expanded
+# ── RUNTIME STATE ──
+FOCUSED_PANEL=0
 COLS=0
 ROWS=0
 NEED_REDRAW=1
 LAST_COLLECT_MS=0
 RUNNING=1
+PROFILE_TICK=0
+readonly PROFILE_EVERY=5   # unit tally costs 16 systemctl calls, poll it sparsely
 
-# ── CPU state (deltas) ───────────────────────────────────────────────────
+# ── CPU STATE ──
 declare -a PREV_CPU_IDLE=()
 declare -a PREV_CPU_TOTAL=()
 declare -a CPU_LOAD=()
+declare -a CPU_FREQS=()
+declare -a CPU_TEMPS=()
 CPU_FREQ_AVG=0
 CPU_TEMP=0
 CPU_GOVERNOR=""
+CPU_DRIVER=""
+CPU_EPP=""
 CPU_BOOST=""
 CPU_CORES=0
-declare -a CPU_FREQS=()
-declare -a CPU_TEMPS=()
 
-# ── GPU state ─────────────────────────────────────────────────────────────
+# ── GPU STATE ──
 GPU_DRM=""
 GPU_SCLK=0
 GPU_MCLK=0
@@ -45,7 +68,7 @@ GPU_VRAM_TOTAL=0
 GPU_POWER=0
 GPU_DPM=""
 
-# ── Network state ─────────────────────────────────────────────────────────
+# ── NETWORK STATE ──
 NET_IFACE=""
 NET_IP=""
 NET_RX_RATE=0
@@ -53,30 +76,37 @@ NET_TX_RATE=0
 NET_WIFI_SIGNAL=""
 NET_WIFI_BAND=""
 NET_WIFI_CHANNEL=""
+NET_POWERSAVE=""
 PREV_NET_RX=0
 PREV_NET_TX=0
 PREV_NET_TIME=0
 
-# ── Storage state ─────────────────────────────────────────────────────────
-STOR_ROOT_USED=""
-STOR_ROOT_TOTAL=""
+# ── STORAGE STATE ──
+STOR_ROOT_USED=0
+STOR_ROOT_TOTAL=0
 STOR_ROOT_PCT=0
-STOR_BTRFS_STATUS=""
-STOR_SNAP_COUNT=0
-STOR_SNAP_LATEST=""
+STOR_FSTYPE=""
+STOR_DISK=""
+STOR_SCHED=""
+STOR_OPTS_OK=0
+STOR_OPTS_MISSING=""
 STOR_IO_READ=0
 STOR_IO_WRITE=0
 PREV_IO_READ=0
 PREV_IO_WRITE=0
 
-# ── Systemd state ─────────────────────────────────────────────────────────
+# ── SYSTEMD STATE ──
 SYS_FAILED_COUNT=0
 SYS_FAILED_UNITS=""
 SYS_BOOT_TIME=""
 SYS_TIMER_COUNT=0
 SYS_JOURNAL_ERRORS=""
+SYS_SVC_OK=0
+SYS_SVC_BAD=""
+SYS_MASK_OK=0
+SYS_MASK_BAD=""
 
-# ── Thermal state ─────────────────────────────────────────────────────────
+# ── THERMAL STATE ──
 THERM_PACKAGE=0
 THERM_CORE=0
 THERM_GPU=0
@@ -86,16 +116,20 @@ THERM_POWER_CORE=0
 THERM_POWER_SOC=0
 THERM_TDP=0
 
-# ── hwmon discovery cache ─────────────────────────────────────────────────
+# ── HWMON DISCOVERY CACHE ──
 HWMON_K10TEMP=""
 HWMON_AMDGPU=""
 
-# ── Colors ────────────────────────────────────────────────────────────────
+# ── COLORS ──
 C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW="" C_CYAN="" C_WHITE=""
 C_BG_BLUE=""
 
 init_colors() {
-    if [[ $USE_COLOR -eq 1 ]] && [[ -t 1 ]]; then
+    # NO_COLOR needs a non-empty value; TERM=dumb disables independently
+    if [[ -n "${NO_COLOR:-}" || "${TERM:-}" == "dumb" ]]; then
+        USE_COLOR=0
+    fi
+    if [[ $USE_COLOR -eq 1 && -t 1 ]]; then
         C_RESET=$'\e[0m'
         C_BOLD=$'\e[1m'
         C_DIM=$'\e[2m'
@@ -106,521 +140,549 @@ init_colors() {
         C_WHITE=$'\e[37m'
         C_BG_BLUE=$'\e[44m'
     fi
+    return 0
 }
 
-# ── Usage ─────────────────────────────────────────────────────────────────
+# ── DIAGNOSTICS: STDERR ONLY ──
+err() { printf '%s\n' "$*" >&2; }
+
+die() {
+    local code=$1
+    shift
+    err "$PROG: $*"
+    exit "$code"
+}
+
+# ── HELP TEXT ──
 usage() {
     cat <<EOF
 Usage: $PROG [OPTIONS]
 
-System monitoring TUI for CachyOS / AMD Strix Halo
+Read-only monitor for the CachyOS profile ry-install deploys on the GTR9 Pro.
 
 Options:
   -i, --interval SEC   Refresh interval in seconds (default: 2, range: 1-10)
   -p, --panel NUM      Start on panel 0-6 (0 = overview, default: 0)
   -l, --log [PATH]     Enable CSV logging (default: \$XDG_DATA_HOME/ry-dashboard/)
       --json           Use JSONL format for logging
-      --no-color       Disable color output
-      --version        Print version and exit
+      --no-color       Disable colored output
+  -v, --version        Print version and exit
   -h, --help           Show this help
 
 Keybinds:
   1-6        Expand panel (CPU/GPU/Net/Disk/Sys/Therm)
-  Esc/0      Return to overview grid
-  d          Toggle detail level in expanded panel
+  Esc/0      Return to the overview grid
+  d          Toggle detail level in an expanded panel
   l          Toggle logging on/off
-  r          Force immediate refresh
-  +/-        Adjust refresh interval
+  r          Force an immediate refresh
+  +/-        Adjust the refresh interval
   q/Ctrl-C   Quit
+
+EXIT CODES: 0 ok · 1 runtime failure · 2 usage · 3 preflight
+
+ENVIRONMENT (see README.md for detail):
+  RY_INSTALL_SKIP_HARDWARE_CHECK=1  Bypass EXPECTED_CPU_MATCH hard-fail.
+  NO_COLOR              Disable colored output when set non-empty (no-color.org).
+  XDG_DATA_HOME         Log directory root. Default ~/.local/share
+
+Profile baseline: ry-install $PROFILE_VERSION.
 EOF
-    exit 0
+    exit "$EXIT_OK"
 }
 
-# ── Argument parsing ──────────────────────────────────────────────────────
+# ── ARGUMENT PARSING ──
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -i|--interval)
-                [[ -z "${2:-}" ]] && { echo "Error: --interval requires a value" >&2; exit 2; }
-                if [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 10 )); then
-                    INTERVAL="$2"
-                else
-                    echo "Error: interval must be 1-10" >&2; exit 2
-                fi
+                [[ -n "${2:-}" ]] || die "$EXIT_USAGE" "--interval requires a value"
+                [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= 1 && $2 <= 10 )) \
+                    || die "$EXIT_USAGE" "--interval must be 1-10"
+                INTERVAL="$2"
                 shift 2 ;;
             -p|--panel)
-                [[ -z "${2:-}" ]] && { echo "Error: --panel requires a value" >&2; exit 2; }
-                if [[ "$2" =~ ^[0-6]$ ]]; then
-                    START_PANEL="$2"
-                else
-                    echo "Error: panel must be 0-6" >&2; exit 2
-                fi
+                [[ -n "${2:-}" ]] || die "$EXIT_USAGE" "--panel requires a value"
+                [[ "$2" =~ ^[0-6]$ ]] || die "$EXIT_USAGE" "--panel must be 0-6"
+                START_PANEL="$2"
                 shift 2 ;;
             -l|--log)
                 LOG_ENABLED=1
-                if [[ -n "${2:-}" ]] && [[ "${2:0:1}" != "-" ]]; then
-                    LOG_PATH="$2"; shift 2
+                if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                    LOG_PATH="$2"
+                    shift 2
                 else
                     shift
                 fi ;;
             --json)     LOG_JSON=1; shift ;;
             --no-color) USE_COLOR=0; shift ;;
-            --version)  echo "$PROG $VERSION"; exit 0 ;;
+            -v|--version) printf 'v%s\n' "$VERSION"; exit "$EXIT_OK" ;;
             -h|--help)  usage ;;
-            *)          echo "Error: unknown option: $1" >&2; exit 2 ;;
+            --)         die "$EXIT_USAGE" "positional arguments are not accepted" ;;
+            -*)         die "$EXIT_USAGE" "unknown option: $1" ;;
+            *)          die "$EXIT_USAGE" "positional arguments are not accepted: $1" ;;
         esac
     done
-
-    # NO_COLOR convention
-    [[ -n "${NO_COLOR:-}" ]] && USE_COLOR=0
+    return 0
 }
 
-# ── Terminal setup/teardown ───────────────────────────────────────────────
+# ── HARDWARE GATE ──
+# Fail-closed on an unreadable model, exactly as the pair does
+hardware_gate() {
+    [[ -n "$EXPECT_CPU_MATCH" ]] || return 0
+    local model=""
+    [[ -r /proc/cpuinfo ]] && model=$(awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo)
+    if [[ "${RY_INSTALL_SKIP_HARDWARE_CHECK:-}" == "1" ]]; then
+        return 0
+    fi
+    local lower_model="${model,,}" lower_match="${EXPECT_CPU_MATCH,,}"
+    if [[ -z "$model" ]]; then
+        err "$PROG: CPU model unreadable; expected a match for '$EXPECT_CPU_MATCH'"
+    elif [[ "$lower_model" != *"$lower_match"* ]]; then
+        err "$PROG: CPU '$model' does not match '$EXPECT_CPU_MATCH'"
+    else
+        return 0
+    fi
+    err "  Override (at your risk): RY_INSTALL_SKIP_HARDWARE_CHECK=1 $PROG"
+    exit "$EXIT_PREFLIGHT"
+}
+
+# ── PREFLIGHT GATES ──
+preflight() {
+    (( BASH_VERSINFO[0] >= 5 )) || die "$EXIT_PREFLIGHT" "bash 5 or newer required, found ${BASH_VERSION}"
+    command -v tput >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "tput not found (install ncurses)"
+    # Query the capability without emitting it - a TERM without it cannot host the TUI
+    [[ -t 0 ]] || die "$EXIT_PREFLIGHT" "stdin is not a terminal"
+    [[ -t 1 ]] || die "$EXIT_PREFLIGHT" "stdout is not a terminal"
+    tput smcup >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "TERM=${TERM:-unset} has no alternate screen"
+    hardware_gate
+    update_term_size
+    (( COLS >= 60 && ROWS >= 20 )) \
+        || die "$EXIT_PREFLIGHT" "terminal too small (need 60x20, have ${COLS}x${ROWS})"
+    return 0
+}
+
+# ── TERMINAL SETUP + TEARDOWN ──
 term_setup() {
-    [[ -t 0 ]] || { echo "Error: stdin is not a terminal" >&2; exit 1; }
-    [[ -t 1 ]] || { echo "Error: stdout is not a terminal" >&2; exit 1; }
-    tput smcup          # alternate screen
-    tput civis          # hide cursor
-    stty -echo -icanon  # raw input
-    printf '\e[?7l'     # disable line wrap
+    tput smcup || die "$EXIT_FAIL" "cannot switch to the alternate screen"
+    tput civis || true          # hide cursor
+    stty -echo -icanon || die "$EXIT_FAIL" "cannot put the terminal in raw mode"
+    printf '\e[?7l'             # disable line wrap
 }
 
 term_restore() {
     printf '\e[?7h'     # re-enable line wrap
-    stty echo icanon 2>/dev/null
-    tput cnorm 2>/dev/null   # show cursor
-    tput rmcup 2>/dev/null   # restore screen
+    stty echo icanon 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
 }
 
 update_term_size() {
     COLS=$(tput cols)
     ROWS=$(tput lines)
     NEED_REDRAW=1
+    return 0
 }
 
-# ── Logging ───────────────────────────────────────────────────────────────
+# ── LOGGING ──
 log_init() {
-    [[ $LOG_ENABLED -eq 0 ]] && return
-
+    (( LOG_ENABLED == 1 )) || return 0
     if [[ -z "$LOG_PATH" ]]; then
         local dir="${XDG_DATA_HOME:-$HOME/.local/share}/ry-dashboard"
-        mkdir -p "$dir"
+        mkdir -p "$dir" && chmod 0700 "$dir" || { err "$PROG: cannot create $dir"; LOG_ENABLED=0; return 0; }
         local ext="csv"
-        [[ $LOG_JSON -eq 1 ]] && ext="jsonl"
-        LOG_PATH="$dir/log-$(date +%Y-%m-%d).$ext"
+        (( LOG_JSON == 1 )) && ext="jsonl"
+        LOG_PATH="$dir/$(date +%Y-%m-%d)-$$.$ext"
     fi
-
-    # Write CSV header if new file
-    if [[ $LOG_JSON -eq 0 ]] && [[ ! -f "$LOG_PATH" ]]; then
-        echo "timestamp,cpu_freq_avg,cpu_temp,cpu_load,gpu_sclk,gpu_temp,gpu_busy,gpu_power,net_rx_rate,net_tx_rate,stor_root_pct,sys_failed,therm_package,therm_fan,therm_tdp" > "$LOG_PATH"
+    # Log rows can carry host telemetry; keep the file owner-only
+    ( umask 0177 && : >> "$LOG_PATH" ) || { err "$PROG: cannot write $LOG_PATH"; LOG_ENABLED=0; return 0; }
+    if (( LOG_JSON == 0 )) && [[ ! -s "$LOG_PATH" ]]; then
+        printf '%s\n' \
+            "timestamp,cpu_freq_avg,cpu_temp,cpu_load,gpu_sclk,gpu_temp,gpu_busy,gpu_power,net_rx_rate,net_tx_rate,stor_root_pct,sys_failed,therm_package,therm_fan,therm_tdp" \
+            >> "$LOG_PATH"
     fi
+    return 0
 }
 
 log_row() {
-    [[ $LOG_ENABLED -eq 0 ]] && return
+    (( LOG_ENABLED == 1 )) || return 0
     local ts
     ts=$(date -Iseconds)
-
-    if [[ $LOG_JSON -eq 1 ]]; then
+    if (( LOG_JSON == 1 )); then
         printf '{"ts":"%s","cpu_freq":%s,"cpu_temp":%s,"cpu_load":%s,"gpu_sclk":%s,"gpu_temp":%s,"gpu_busy":%s,"gpu_power":%s,"net_rx":%s,"net_tx":%s,"root_pct":%s,"failed":%s,"pkg_temp":%s,"fan":%s,"tdp":%s}\n' \
-            "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "${CPU_LOAD[0]:-0}" \
+            "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "$(cpu_load_avg)" \
             "$GPU_SCLK" "$GPU_TEMP" "$GPU_BUSY" "$GPU_POWER" \
             "$NET_RX_RATE" "$NET_TX_RATE" "$STOR_ROOT_PCT" \
             "$SYS_FAILED_COUNT" "$THERM_PACKAGE" "$THERM_FAN" "$THERM_TDP" \
             >> "$LOG_PATH"
     else
         printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-            "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "${CPU_LOAD[0]:-0}" \
+            "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "$(cpu_load_avg)" \
             "$GPU_SCLK" "$GPU_TEMP" "$GPU_BUSY" "$GPU_POWER" \
             "$NET_RX_RATE" "$NET_TX_RATE" "$STOR_ROOT_PCT" \
             "$SYS_FAILED_COUNT" "$THERM_PACKAGE" "$THERM_FAN" "$THERM_TDP" \
             >> "$LOG_PATH"
     fi
+    return 0
 }
 
-# ── hwmon discovery ───────────────────────────────────────────────────────
-# Finds hwmon path by name, not index — stable across boots
+# ── SYSFS READS ──
+# Read a sysfs file with the builtin, never cat — this runs per core per tick
+read_sysfs() {
+    local file="$1" fallback="${2:-0}" val
+    if [[ -r "$file" ]] && val=$(< "$file") 2>/dev/null && [[ -n "$val" ]]; then
+        printf '%s\n' "$val"
+    else
+        printf '%s\n' "$fallback"
+    fi
+    return 0
+}
+
+# ── HWMON + DRM DISCOVERY ──
+# Discovery is by name, never hwmon index — indexes reshuffle across boots
 find_hwmon() {
-    local target="$1"
-    local path
+    local target="$1" path
     for path in /sys/class/hwmon/hwmon*; do
-        [[ -f "$path/name" ]] || continue
+        [[ -r "$path/name" ]] || continue
         if [[ "$(< "$path/name")" == "$target" ]]; then
-            echo "$path"
+            printf '%s\n' "$path"
             return 0
         fi
     done
     return 1
 }
 
-discover_hwmon() {
-    HWMON_K10TEMP=$(find_hwmon "k10temp" 2>/dev/null) || HWMON_K10TEMP=""
-    HWMON_AMDGPU=$(find_hwmon "amdgpu" 2>/dev/null) || HWMON_AMDGPU=""
-
-    # GPU DRM path — find by vendor (AMD = 0x1002)
+discover_hardware() {
+    HWMON_K10TEMP=$(find_hwmon k10temp) || HWMON_K10TEMP=""
+    HWMON_AMDGPU=$(find_hwmon amdgpu) || HWMON_AMDGPU=""
     local card
     for card in /sys/class/drm/card[0-9]; do
-        [[ -f "$card/device/vendor" ]] || continue
-        if [[ "$(< "$card/device/vendor")" == "0x1002" ]]; then
+        [[ -r "$card/device/vendor" ]] || continue
+        if [[ "$(< "$card/device/vendor")" == "0x1002" ]]; then   # AMD vendor ID
             GPU_DRM="$card/device"
             break
         fi
     done
-
-    # Core count
     CPU_CORES=$(nproc 2>/dev/null) || CPU_CORES=0
+    return 0
 }
 
-# ── Data collection ───────────────────────────────────────────────────────
-
-read_sysfs() {
-    # Safely read a sysfs file, return fallback on failure
-    local file="$1" fallback="${2:-0}"
-    if [[ -r "$file" ]]; then
-        cat "$file" 2>/dev/null || echo "$fallback"
-    else
-        echo "$fallback"
-    fi
-}
-
+# ── COLLECTORS ──
 collect_cpu() {
-    local i freq total idle
-    local -a fields
-
-    # Per-core frequencies
+    local i freq t
     CPU_FREQS=()
     local freq_sum=0 freq_count=0
     for ((i = 0; i < CPU_CORES; i++)); do
         freq=$(read_sysfs "/sys/devices/system/cpu/cpu${i}/cpufreq/scaling_cur_freq" 0)
-        freq=$((freq / 1000))  # kHz → MHz
+        freq=$((freq / 1000))   # kHz -> MHz
         CPU_FREQS+=("$freq")
         freq_sum=$((freq_sum + freq))
         freq_count=$((freq_count + 1))
     done
-    [[ $freq_count -gt 0 ]] && CPU_FREQ_AVG=$((freq_sum / freq_count)) || CPU_FREQ_AVG=0
+    if (( freq_count > 0 )); then CPU_FREQ_AVG=$((freq_sum / freq_count)); else CPU_FREQ_AVG=0; fi
 
-    # CPU temperature from k10temp
     if [[ -n "$HWMON_K10TEMP" ]]; then
-        local raw
-        raw=$(read_sysfs "$HWMON_K10TEMP/temp1_input" 0)
-        CPU_TEMP=$((raw / 1000))
-
-        # Per-CCD temps if available
+        CPU_TEMP=$(( $(read_sysfs "$HWMON_K10TEMP/temp1_input" 0) / 1000 ))
         CPU_TEMPS=("$CPU_TEMP")
-        local t
         for t in "$HWMON_K10TEMP"/temp{2,3,4,5}_input; do
-            if [[ -r "$t" ]]; then
-                CPU_TEMPS+=("$(( $(< "$t") / 1000 ))")
-            else
-                break
-            fi
+            [[ -r "$t" ]] || break
+            CPU_TEMPS+=("$(( $(< "$t") / 1000 ))")
         done
     fi
 
-    # Governor & boost
-    CPU_GOVERNOR=$(read_sysfs "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" "unknown")
-    local boost_file="/sys/devices/system/cpu/cpufreq/boost"
-    [[ -r "$boost_file" ]] && CPU_BOOST=$(read_sysfs "$boost_file" "?") || CPU_BOOST="?"
-    if [[ "$CPU_BOOST" == "1" ]]; then
-        CPU_BOOST="on"
-    elif [[ "$CPU_BOOST" == "0" ]]; then
-        CPU_BOOST="off"
-    fi
+    CPU_GOVERNOR=$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor unknown)
+    CPU_DRIVER=$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver unknown)
+    CPU_EPP=$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference unknown)
+    CPU_BOOST=$(read_sysfs /sys/devices/system/cpu/cpufreq/boost '?')
+    case "$CPU_BOOST" in
+        1) CPU_BOOST="on" ;;
+        0) CPU_BOOST="off" ;;
+    esac
 
-    # Per-CPU load from /proc/stat
-    local line cpu_id
+    collect_cpu_load
+    return 0
+}
+
+collect_cpu_load() {
+    local i total idle line cpu_id
+    local -a fields
     while IFS= read -r line; do
         [[ "$line" =~ ^cpu([0-9]+)\  ]] || continue
         cpu_id="${BASH_REMATCH[1]}"
         read -ra fields <<< "$line"
-        # fields: cpu# user nice system idle iowait irq softirq steal
-        idle=$((fields[4] + fields[5]))  # idle + iowait
+        idle=$((fields[4] + fields[5]))   # idle + iowait
         total=0
         for ((i = 1; i < ${#fields[@]}; i++)); do
             total=$((total + fields[i]))
         done
-
         if [[ -n "${PREV_CPU_TOTAL[$cpu_id]:-}" ]]; then
             local d_total=$((total - PREV_CPU_TOTAL[cpu_id]))
             local d_idle=$((idle - PREV_CPU_IDLE[cpu_id]))
-            if [[ $d_total -gt 0 ]]; then
-                CPU_LOAD[$cpu_id]=$(( (d_total - d_idle) * 100 / d_total ))
+            if (( d_total > 0 )); then
+                CPU_LOAD[cpu_id]=$(( (d_total - d_idle) * 100 / d_total ))
             else
-                CPU_LOAD[$cpu_id]=0
+                CPU_LOAD[cpu_id]=0
             fi
         else
-            CPU_LOAD[$cpu_id]=0
+            CPU_LOAD[cpu_id]=0
         fi
-
-        PREV_CPU_TOTAL[$cpu_id]=$total
-        PREV_CPU_IDLE[$cpu_id]=$idle
+        PREV_CPU_TOTAL[cpu_id]=$total
+        PREV_CPU_IDLE[cpu_id]=$idle
     done < /proc/stat
+    return 0
+}
+
+# Parse the active (starred) row out of a pp_dpm_* table
+dpm_active() {
+    local file="$1" line val
+    [[ -r "$file" ]] || { printf '0\n'; return 0; }
+    while IFS= read -r line; do
+        [[ "$line" == *"*" ]] || continue
+        val="${line##*: }"
+        val="${val%%[Mm]hz*}"
+        val="${val%%[Mm]Hz*}"
+        printf '%s\n' "${val// /}"
+        return 0
+    done < "$file"
+    printf '0\n'
+    return 0
 }
 
 collect_gpu() {
-    [[ -z "$GPU_DRM" ]] && return
-
-    # Clock speeds — parse active (*) line from pp_dpm_sclk
-    if [[ -r "$GPU_DRM/pp_dpm_sclk" ]]; then
-        local line
-        while IFS= read -r line; do
-            if [[ "$line" == *"*" ]]; then
-                # Format: "N: XXXXMhz *"
-                GPU_SCLK="${line##*: }"
-                GPU_SCLK="${GPU_SCLK%%Mhz*}"
-                GPU_SCLK="${GPU_SCLK%%MHz*}"
-                GPU_SCLK="${GPU_SCLK// /}"
-                break
-            fi
-        done < "$GPU_DRM/pp_dpm_sclk"
-    fi
-
-    if [[ -r "$GPU_DRM/pp_dpm_mclk" ]]; then
-        local line
-        while IFS= read -r line; do
-            if [[ "$line" == *"*" ]]; then
-                GPU_MCLK="${line##*: }"
-                GPU_MCLK="${GPU_MCLK%%Mhz*}"
-                GPU_MCLK="${GPU_MCLK%%MHz*}"
-                GPU_MCLK="${GPU_MCLK// /}"
-                break
-            fi
-        done < "$GPU_DRM/pp_dpm_mclk"
-    fi
-
+    [[ -n "$GPU_DRM" ]] || return 0
+    GPU_SCLK=$(dpm_active "$GPU_DRM/pp_dpm_sclk")
+    GPU_MCLK=$(dpm_active "$GPU_DRM/pp_dpm_mclk")
     GPU_BUSY=$(read_sysfs "$GPU_DRM/gpu_busy_percent" 0)
-
-    # VRAM
-    local vram_used vram_total
-    vram_used=$(read_sysfs "$GPU_DRM/mem_info_vram_used" 0)
-    vram_total=$(read_sysfs "$GPU_DRM/mem_info_vram_total" 0)
-    GPU_VRAM_USED=$((vram_used / 1048576))    # bytes → MB
-    GPU_VRAM_TOTAL=$((vram_total / 1048576))
-
-    # DPM level
-    if [[ -r "$GPU_DRM/power_dpm_force_performance_level" ]]; then
-        GPU_DPM=$(< "$GPU_DRM/power_dpm_force_performance_level")
-    fi
-
-    # Temperature and power from amdgpu hwmon
+    GPU_VRAM_USED=$(( $(read_sysfs "$GPU_DRM/mem_info_vram_used" 0) / 1048576 ))
+    GPU_VRAM_TOTAL=$(( $(read_sysfs "$GPU_DRM/mem_info_vram_total" 0) / 1048576 ))
+    GPU_DPM=$(read_sysfs "$GPU_DRM/power_dpm_force_performance_level" unknown)
     if [[ -n "$HWMON_AMDGPU" ]]; then
-        local raw
-        raw=$(read_sysfs "$HWMON_AMDGPU/temp1_input" 0)
-        GPU_TEMP=$((raw / 1000))
-
-        # Power — prefer power1_average, fallback power1_input
+        GPU_TEMP=$(( $(read_sysfs "$HWMON_AMDGPU/temp1_input" 0) / 1000 ))
         if [[ -r "$HWMON_AMDGPU/power1_average" ]]; then
-            raw=$(read_sysfs "$HWMON_AMDGPU/power1_average" 0)
-            GPU_POWER=$((raw / 1000000))  # microwatts → W
+            GPU_POWER=$(( $(read_sysfs "$HWMON_AMDGPU/power1_average" 0) / 1000000 ))
         elif [[ -r "$HWMON_AMDGPU/power1_input" ]]; then
-            raw=$(read_sysfs "$HWMON_AMDGPU/power1_input" 0)
-            GPU_POWER=$((raw / 1000000))
+            GPU_POWER=$(( $(read_sysfs "$HWMON_AMDGPU/power1_input" 0) / 1000000 ))
         fi
     fi
+    return 0
 }
 
 collect_network() {
-    # Find primary interface (first non-lo with carrier)
+    local iface name
     if [[ -z "$NET_IFACE" ]]; then
-        local iface
         for iface in /sys/class/net/*; do
-            local name="${iface##*/}"
+            name="${iface##*/}"
             [[ "$name" == "lo" ]] && continue
-            [[ "$(read_sysfs "$iface/carrier" 0)" == "1" ]] && { NET_IFACE="$name"; break; }
+            if [[ "$(read_sysfs "$iface/carrier" 0)" == "1" ]]; then
+                NET_IFACE="$name"
+                break
+            fi
         done
-        # Fallback: first non-lo
         if [[ -z "$NET_IFACE" ]]; then
             for iface in /sys/class/net/*; do
-                local name="${iface##*/}"
-                [[ "$name" != "lo" ]] && { NET_IFACE="$name"; break; }
+                name="${iface##*/}"
+                if [[ "$name" != "lo" ]]; then
+                    NET_IFACE="$name"
+                    break
+                fi
             done
         fi
     fi
+    [[ -n "$NET_IFACE" ]] || return 0
 
-    [[ -z "$NET_IFACE" ]] && return
+    # The profile ships ipv6.disable=1, so IPv4 is the only address family
+    NET_IP=$(ip -4 -br addr show "$NET_IFACE" 2>/dev/null | awk 'NR==1{split($3,a,"/"); print a[1]}') || NET_IP=""
 
-    # IP address
-    NET_IP=$(ip -4 -br addr show "$NET_IFACE" 2>/dev/null | awk '{print $3}' | cut -d/ -f1)
-
-    # RX/TX rates
-    local now rx tx
-    now=$(date +%s%N)
-    now=$((now / 1000000))  # milliseconds
+    local now rx tx dt
+    now=$(( $(date +%s%N) / 1000000 ))
     rx=$(read_sysfs "/sys/class/net/$NET_IFACE/statistics/rx_bytes" 0)
     tx=$(read_sysfs "/sys/class/net/$NET_IFACE/statistics/tx_bytes" 0)
-
-    if [[ $PREV_NET_TIME -gt 0 ]]; then
-        local dt=$(( (now - PREV_NET_TIME) ))
-        if [[ $dt -gt 0 ]]; then
-            # bytes/s → KB/s (multiply by 1000 for ms→s conversion)
+    if (( PREV_NET_TIME > 0 )); then
+        dt=$((now - PREV_NET_TIME))
+        if (( dt > 0 )); then
             NET_RX_RATE=$(( (rx - PREV_NET_RX) * 1000 / dt / 1024 ))
             NET_TX_RATE=$(( (tx - PREV_NET_TX) * 1000 / dt / 1024 ))
-            # Clamp negative (counter reset)
-            [[ $NET_RX_RATE -lt 0 ]] && NET_RX_RATE=0
-            [[ $NET_TX_RATE -lt 0 ]] && NET_TX_RATE=0
+            (( NET_RX_RATE < 0 )) && NET_RX_RATE=0
+            (( NET_TX_RATE < 0 )) && NET_TX_RATE=0
         fi
     fi
-
     PREV_NET_RX=$rx
     PREV_NET_TX=$tx
     PREV_NET_TIME=$now
 
-    # WiFi info from /proc/net/wireless
+    collect_wifi
+    return 0
+}
+
+collect_wifi() {
     NET_WIFI_SIGNAL=""
     NET_WIFI_BAND=""
     NET_WIFI_CHANNEL=""
-    if [[ -f /proc/net/wireless ]]; then
+    NET_POWERSAVE=""
+    [[ -n "$NET_IFACE" ]] || return 0
+    if [[ -r /proc/net/wireless ]]; then
         local wline
-        wline=$(grep "^ *${NET_IFACE}" /proc/net/wireless 2>/dev/null) || true
+        local -a wfields
+        wline=$(grep "^ *${NET_IFACE}:" /proc/net/wireless 2>/dev/null) || wline=""
         if [[ -n "$wline" ]]; then
-            # Format: iface: status link level noise ...
             read -ra wfields <<< "$wline"
-            NET_WIFI_SIGNAL="${wfields[3]%%.*}"  # dBm, strip trailing dot
-            NET_WIFI_SIGNAL="${NET_WIFI_SIGNAL%.}"
+            NET_WIFI_SIGNAL="${wfields[3]%%.*}"   # dBm, strip the trailing dot
         fi
     fi
-
-    # Band/channel from iw (if available)
-    if command -v iw &>/dev/null && [[ -n "$NET_WIFI_SIGNAL" ]]; then
+    if [[ -n "$NET_WIFI_SIGNAL" ]] && command -v iw >/dev/null 2>&1; then
         local iw_out
-        iw_out=$(iw dev "$NET_IFACE" info 2>/dev/null) || true
+        iw_out=$(iw dev "$NET_IFACE" info 2>/dev/null) || iw_out=""
         if [[ -n "$iw_out" ]]; then
-            NET_WIFI_CHANNEL=$(echo "$iw_out" | grep -oP 'channel \K[0-9]+' | head -1)
+            NET_WIFI_CHANNEL=$(awk '/channel/{for(i=1;i<=NF;i++) if($i=="channel"){print $(i+1); exit}}' <<< "$iw_out")
+            NET_POWERSAVE=$(awk '/power save/{print $NF; exit}' <<< "$iw_out")
             local freq
-            freq=$(echo "$iw_out" | grep -oP '\(\K[0-9]+(?= MHz)' | head -1)
+            freq=$(sed -n 's/.*(\([0-9]\+\) MHz).*/\1/p' <<< "$iw_out" | head -1) || freq=""
             if [[ -n "$freq" ]]; then
-                if (( freq < 3000 )); then
-                    NET_WIFI_BAND="2.4"
-                elif (( freq < 6000 )); then
-                    NET_WIFI_BAND="5"
-                else
-                    NET_WIFI_BAND="6"
-                fi
+                if (( freq < 3000 )); then NET_WIFI_BAND="2.4"
+                elif (( freq < 5900 )); then NET_WIFI_BAND="5"
+                else NET_WIFI_BAND="6"; fi
             fi
         fi
     fi
+    return 0
 }
 
 collect_storage() {
-    # Root partition usage
     local df_out
-    df_out=$(df -B1 / 2>/dev/null | tail -1) || true
+    local -a df_fields
+    df_out=$(df -B1 --output=size,used,pcent / 2>/dev/null | tail -1) || df_out=""
     if [[ -n "$df_out" ]]; then
         read -ra df_fields <<< "$df_out"
-        STOR_ROOT_TOTAL=$(( df_fields[1] / 1073741824 ))  # bytes → GB
-        STOR_ROOT_USED=$(( df_fields[2] / 1073741824 ))
-        STOR_ROOT_PCT="${df_fields[4]%%%}"
+        STOR_ROOT_TOTAL=$(( df_fields[0] / 1073741824 ))   # bytes -> GiB
+        STOR_ROOT_USED=$(( df_fields[1] / 1073741824 ))
+        STOR_ROOT_PCT="${df_fields[2]%\%}"
     fi
 
-    # Btrfs status
-    STOR_BTRFS_STATUS="n/a"
-    if command -v btrfs &>/dev/null; then
-        if btrfs filesystem show / &>/dev/null; then
-            local dev_stats
-            dev_stats=$(btrfs device stats / 2>/dev/null) || true
-            if [[ -n "$dev_stats" ]]; then
-                local err_count
-                err_count=$(echo "$dev_stats" | awk -F'[. ]+' '{s+=$NF} END{print s+0}')
-                [[ "$err_count" -eq 0 ]] && STOR_BTRFS_STATUS="OK" || STOR_BTRFS_STATUS="${err_count} errors"
-            fi
+    # The profile rewrites ext4 rows to noatime,lazytime,commit=10 — check live
+    STOR_FSTYPE=$(findmnt -no FSTYPE / 2>/dev/null) || STOR_FSTYPE="?"
+    local opts opt
+    opts=$(findmnt -no OPTIONS / 2>/dev/null) || opts=""
+    STOR_OPTS_OK=0
+    STOR_OPTS_MISSING=""
+    for opt in "${EXPECT_FSTAB_OPTS[@]}"; do
+        if [[ ",$opts," == *",$opt,"* ]]; then
+            STOR_OPTS_OK=$((STOR_OPTS_OK + 1))
+        else
+            STOR_OPTS_MISSING+="${STOR_OPTS_MISSING:+ }$opt"
         fi
-    fi
+    done
 
-    # Snapshot count
-    STOR_SNAP_COUNT=0
-    STOR_SNAP_LATEST=""
-    if command -v btrfs &>/dev/null; then
-        local snap_list
-        snap_list=$(btrfs subvolume list -s / 2>/dev/null) || true
-        if [[ -n "$snap_list" ]]; then
-            STOR_SNAP_COUNT=$(echo "$snap_list" | wc -l)
-            STOR_SNAP_LATEST=$(echo "$snap_list" | tail -1 | grep -oP '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' | head -1)
-        fi
-    fi
-
-    # IO rates from /proc/diskstats (root device)
     local root_dev
-    root_dev=$(findmnt -no SOURCE / 2>/dev/null | sed 's|/dev/||; s|\[.*||') || true
-    # Strip partition number for diskstats lookup
-    local disk_name="${root_dev%%[0-9]*}"
-    # For nvme: nvme0n1p2 → nvme0n1
-    [[ "$root_dev" == nvme* ]] && disk_name="${root_dev%%p[0-9]*}"
+    root_dev=$(findmnt -no SOURCE / 2>/dev/null | sed 's|/dev/||; s|\[.*||') || root_dev=""
+    STOR_DISK="${root_dev%%[0-9]*}"
+    [[ "$root_dev" == nvme* ]] && STOR_DISK="${root_dev%%p[0-9]*}"
 
-    if [[ -n "$disk_name" ]] && [[ -f /proc/diskstats ]]; then
+    # 99-ry-perf.rules pins the NVMe scheduler to none, outranking the vendor kyber
+    STOR_SCHED="?"
+    if [[ -n "$STOR_DISK" && -r "/sys/block/$STOR_DISK/queue/scheduler" ]]; then
+        local sched
+        sched=$(< "/sys/block/$STOR_DISK/queue/scheduler")
+        if [[ "$sched" =~ \[([a-z-]+)\] ]]; then
+            STOR_SCHED="${BASH_REMATCH[1]}"
+        else
+            STOR_SCHED="${sched%% *}"
+        fi
+    fi
+
+    collect_storage_io
+    return 0
+}
+
+collect_storage_io() {
+    if [[ -n "$STOR_DISK" && -r /proc/diskstats ]]; then
         local ds_line
-        ds_line=$(awk -v d="$disk_name" '$3 == d {print}' /proc/diskstats 2>/dev/null) || true
+        local -a ds
+        ds_line=$(awk -v d="$STOR_DISK" '$3 == d {print; exit}' /proc/diskstats 2>/dev/null) || ds_line=""
         if [[ -n "$ds_line" ]]; then
             read -ra ds <<< "$ds_line"
-            # fields[5] = sectors read, fields[9] = sectors written (512 bytes each)
-            local cur_read=$(( ds[5] * 512 ))
-            local cur_write=$(( ds[9] * 512 ))
-
-            if [[ $PREV_IO_READ -gt 0 ]]; then
+            local cur_read=$(( ds[5] * 512 ))    # sectors read
+            local cur_write=$(( ds[9] * 512 ))   # sectors written
+            if (( PREV_IO_READ > 0 )); then
                 local d_read=$((cur_read - PREV_IO_READ))
                 local d_write=$((cur_write - PREV_IO_WRITE))
-                [[ $d_read -lt 0 ]] && d_read=0
-                [[ $d_write -lt 0 ]] && d_write=0
-                STOR_IO_READ=$((d_read / INTERVAL / 1048576))   # MB/s
+                (( d_read < 0 )) && d_read=0
+                (( d_write < 0 )) && d_write=0
+                STOR_IO_READ=$((d_read / INTERVAL / 1048576))     # MB/s
                 STOR_IO_WRITE=$((d_write / INTERVAL / 1048576))
             fi
-
             PREV_IO_READ=$cur_read
             PREV_IO_WRITE=$cur_write
         fi
     fi
+    return 0
 }
 
 collect_systemd() {
-    # Failed units
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local failed_out
     SYS_FAILED_UNITS=""
     SYS_FAILED_COUNT=0
-    local failed_out
-    failed_out=$(systemctl --failed --no-legend --plain 2>/dev/null) || true
+    failed_out=$(systemctl --failed --no-legend --plain 2>/dev/null) || failed_out=""
     if [[ -n "$failed_out" ]]; then
-        SYS_FAILED_COUNT=$(echo "$failed_out" | wc -l)
-        SYS_FAILED_UNITS=$(echo "$failed_out" | awk '{print $1}' | head -10)
+        SYS_FAILED_COUNT=$(wc -l <<< "$failed_out")
+        SYS_FAILED_UNITS=$(awk '{print $1}' <<< "$failed_out" | head -10)
     fi
 
-    # Boot time
-    SYS_BOOT_TIME=$(systemd-analyze 2>/dev/null | head -1 | grep -oP '= .*' | sed 's/= //') || SYS_BOOT_TIME="?"
-
-    # Active timers count
+    SYS_BOOT_TIME=$(systemd-analyze 2>/dev/null | awk -F'= ' 'NR==1{print $2; exit}') || SYS_BOOT_TIME=""
+    [[ -n "$SYS_BOOT_TIME" ]] || SYS_BOOT_TIME="?"
     SYS_TIMER_COUNT=$(systemctl list-timers --no-legend 2>/dev/null | wc -l) || SYS_TIMER_COUNT=0
 
-    # Recent journal errors (last 5 min, priority err+)
+    if (( PROFILE_TICK % PROFILE_EVERY == 0 )); then
+        collect_profile_units
+    fi
+    PROFILE_TICK=$((PROFILE_TICK + 1))
+
     SYS_JOURNAL_ERRORS=""
-    local je
-    je=$(journalctl -p err --since "5 min ago" --no-pager -q --output=short-monotonic 2>/dev/null | tail -5) || true
-    SYS_JOURNAL_ERRORS="$je"
+    if command -v journalctl >/dev/null 2>&1; then
+        SYS_JOURNAL_ERRORS=$(journalctl -p err --since "5 min ago" --no-pager -q -o short-monotonic 2>/dev/null | tail -5) || SYS_JOURNAL_ERRORS=""
+    fi
+    return 0
+}
+
+# EXPECT_SERVICES must read active, EXPECT_MASK must read masked
+collect_profile_units() {
+    local unit state
+    SYS_SVC_OK=0
+    SYS_SVC_BAD=""
+    for unit in "${EXPECT_SERVICES[@]}"; do
+        state=$(systemctl is-active "$unit" 2>/dev/null) || true
+        if [[ "$state" == "active" || "$state" == "waiting" ]]; then
+            SYS_SVC_OK=$((SYS_SVC_OK + 1))
+        else
+            SYS_SVC_BAD+="${SYS_SVC_BAD:+$'\n'}$unit (${state:-unknown})"
+        fi
+    done
+    SYS_MASK_OK=0
+    SYS_MASK_BAD=""
+    for unit in "${EXPECT_MASK[@]}"; do
+        state=$(systemctl is-enabled "$unit" 2>/dev/null) || true
+        if [[ "$state" == "masked" ]]; then
+            SYS_MASK_OK=$((SYS_MASK_OK + 1))
+        else
+            SYS_MASK_BAD+="${SYS_MASK_BAD:+$'\n'}$unit (${state:-unknown})"
+        fi
+    done
+    return 0
 }
 
 collect_thermal() {
-    # From k10temp
     if [[ -n "$HWMON_K10TEMP" ]]; then
-        local raw
-        raw=$(read_sysfs "$HWMON_K10TEMP/temp1_input" 0)
-        THERM_PACKAGE=$((raw / 1000))
-
-        # Tctl (often temp1), Tccd (temp3+)
+        THERM_PACKAGE=$(( $(read_sysfs "$HWMON_K10TEMP/temp1_input" 0) / 1000 ))
         [[ -r "$HWMON_K10TEMP/temp2_input" ]] && THERM_CORE=$(( $(< "$HWMON_K10TEMP/temp2_input") / 1000 ))
     fi
-
-    # From amdgpu hwmon
     if [[ -n "$HWMON_AMDGPU" ]]; then
-        # Edge temp (temp1), junction (temp2), memory (temp3)
         [[ -r "$HWMON_AMDGPU/temp1_input" ]] && THERM_EDGE=$(( $(< "$HWMON_AMDGPU/temp1_input") / 1000 ))
         [[ -r "$HWMON_AMDGPU/temp2_input" ]] && THERM_GPU=$(( $(< "$HWMON_AMDGPU/temp2_input") / 1000 ))
-
-        # Fan RPM
         THERM_FAN=$(read_sysfs "$HWMON_AMDGPU/fan1_input" 0)
-
-        # Power rails
         [[ -r "$HWMON_AMDGPU/power1_average" ]] && THERM_POWER_CORE=$(( $(read_sysfs "$HWMON_AMDGPU/power1_average" 0) / 1000000 ))
         [[ -r "$HWMON_AMDGPU/power2_average" ]] && THERM_POWER_SOC=$(( $(read_sysfs "$HWMON_AMDGPU/power2_average" 0) / 1000000 ))
-
-        # TDP / power cap
         [[ -r "$HWMON_AMDGPU/power1_cap" ]] && THERM_TDP=$(( $(read_sysfs "$HWMON_AMDGPU/power1_cap" 0) / 1000000 ))
     fi
+    return 0
 }
 
 collect_all() {
@@ -630,17 +692,14 @@ collect_all() {
     collect_storage
     collect_systemd
     collect_thermal
+    return 0
 }
 
-# ── Rendering helpers ─────────────────────────────────────────────────────
-
-# Move cursor to row, col (1-indexed)
+# ── RENDERING HELPERS ──
 goto() { printf '\e[%d;%dH' "$1" "$2"; }
 
-# Clear screen without flicker — just reposition
 clear_content() { printf '\e[2J\e[H'; }
 
-# Print at position with color
 put() {
     local row=$1 col=$2 color=$3
     shift 3
@@ -648,25 +707,6 @@ put() {
     printf '%s%s%s' "$color" "$*" "$C_RESET"
 }
 
-# Draw horizontal line
-hline() {
-    local row=$1 col=$2 width=$3 char="${4:-─}"
-    goto "$row" "$col"
-    printf '%*s' "$width" '' | tr ' ' "$char"
-}
-
-# Right-align text in a field
-rpad() {
-    local text="$1" width="$2"
-    printf '%*s' "$width" "$text"
-}
-
-lpad() {
-    local text="$1" width="$2"
-    printf '%-*s' "$width" "$text"
-}
-
-# Format bytes as human-readable
 fmt_rate() {
     local kb=$1
     if (( kb >= 1024 )); then
@@ -676,32 +716,31 @@ fmt_rate() {
     fi
 }
 
-# Color a value based on threshold: green < warn < crit = red
+# Green below warn, yellow to crit, red at or above crit
 color_threshold() {
     local val=$1 warn=$2 crit=$3
-    if (( val >= crit )); then
-        printf '%s' "$C_RED"
-    elif (( val >= warn )); then
-        printf '%s' "$C_YELLOW"
-    else
-        printf '%s' "$C_GREEN"
-    fi
+    if (( val >= crit )); then printf '%s' "$C_RED"
+    elif (( val >= warn )); then printf '%s' "$C_YELLOW"
+    else printf '%s' "$C_GREEN"; fi
 }
 
-# CPU load average (across all cores)
+# Green when the live value equals the value ry-install deploys
+color_expect() {
+    if [[ "$1" == "$2" ]]; then printf '%s' "$C_GREEN"; else printf '%s' "$C_YELLOW"; fi
+}
+
+color_count() {
+    if (( $1 == $2 )); then printf '%s' "$C_GREEN"; else printf '%s' "$C_RED"; fi
+}
+
 cpu_load_avg() {
     local sum=0 count=0 i
     for ((i = 0; i < CPU_CORES; i++)); do
         sum=$((sum + ${CPU_LOAD[$i]:-0}))
         count=$((count + 1))
     done
-    [[ $count -gt 0 ]] && echo $((sum / count)) || echo 0
+    if (( count > 0 )); then printf '%d\n' $((sum / count)); else printf '0\n'; fi
 }
-
-# ── Panel renderers (grid mode) ──────────────────────────────────────────
-
-# Each panel gets: start_row, start_col, width, height
-# Panels write within their bounds
 
 render_panel_header() {
     local row=$1 col=$2 width=$3 title=$4
@@ -714,351 +753,380 @@ render_panel_header() {
         printf '%*s' "$((remain - 1))" '' | tr ' ' '─'
         printf '%s' "$C_RESET"
     fi
+    return 0
 }
 
+# ── GRID PANELS ──
 render_cpu_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "CPU"
-    local load_avg
+    local load_avg tc
     load_avg=$(cpu_load_avg)
-    local tc
-    tc=$(color_threshold "$CPU_TEMP" 70 85)
-
+    tc=$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Avg: %-5s MHz  Load: %s%3d%%%s' "$CPU_FREQ_AVG" "$(color_threshold "$load_avg" 60 90)" "$load_avg" "$C_RESET")"
-    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Temp: %s%3d°C%s     Gov: %s' "$tc" "$CPU_TEMP" "$C_RESET" "$CPU_GOVERNOR")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Boost: %-3s     Cores: %d' "$CPU_BOOST" "$CPU_CORES")"
-
-    # Per-core freq summary (first 8, abbreviated)
+    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Temp: %s%3d°C%s     Gov: %s%s%s' "$tc" "$CPU_TEMP" "$C_RESET" "$(color_expect "$CPU_GOVERNOR" "$EXPECT_GOVERNOR")" "$CPU_GOVERNOR" "$C_RESET")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'EPP: %s%-12s%s Cores: %d' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$CPU_CORES")"
     if (( h > 4 )); then
-        local core_str="" i
-        local show=$((CPU_CORES < 8 ? CPU_CORES : 8))
+        local core_str="" i show
+        show=$(( CPU_CORES < 8 ? CPU_CORES : 8 ))
         for ((i = 0; i < show; i++)); do
             core_str+="$(printf 'C%d:%4d ' "$i" "${CPU_FREQS[$i]:-0}")"
         done
-        [[ $CPU_CORES -gt 8 ]] && core_str+="..."
+        (( CPU_CORES > 8 )) && core_str+="..."
         put $((r+4)) "$c" "$C_DIM" "${core_str:0:$w}"
     fi
+    return 0
 }
 
 render_gpu_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "GPU"
-
     if [[ -z "$GPU_DRM" ]]; then
         put $((r+1)) "$c" "$C_DIM" "No AMD GPU detected"
-        return
+        return 0
     fi
-
-    local tc
-    tc=$(color_threshold "$GPU_TEMP" 70 90)
-    local vram_gb=""
+    local tc vram_gb=""
+    tc=$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
     if (( GPU_VRAM_TOTAL > 0 )); then
         vram_gb="$(printf '%d.%d/%d.%d GB' $((GPU_VRAM_USED/1024)) $(( (GPU_VRAM_USED%1024)*10/1024 )) $((GPU_VRAM_TOTAL/1024)) $(( (GPU_VRAM_TOTAL%1024)*10/1024 )))"
     fi
-
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'SCLK: %-5s MHz  Busy: %s%3d%%%s' "$GPU_SCLK" "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "$C_RESET")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf 'Temp: %s%3d°C%s     VRAM: %s' "$tc" "$GPU_TEMP" "$C_RESET" "$vram_gb")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Power: %3dW      DPM: %s' "$GPU_POWER" "${GPU_DPM:-?}")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Power: %3dW      DPM: %s%s%s' "$GPU_POWER" "$(color_expect "$GPU_DPM" "$EXPECT_GPU_DPM")" "${GPU_DPM:-?}" "$C_RESET")"
+    return 0
 }
 
 render_network_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "NETWORK"
-
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'IF: %-12s IP: %s' "${NET_IFACE:-none}" "${NET_IP:-?}")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf '↓ %-14s ↑ %s' "$(fmt_rate "$NET_RX_RATE")" "$(fmt_rate "$NET_TX_RATE")")"
-
-    if [[ -n "$NET_WIFI_SIGNAL" ]] && [[ "$NET_WIFI_SIGNAL" =~ ^-?[0-9]+$ ]]; then
-        local sig_color sig_abs
+    if [[ "$NET_WIFI_SIGNAL" =~ ^-?[0-9]+$ ]]; then
+        local sig_abs sig_color
         sig_abs=${NET_WIFI_SIGNAL#-}
         sig_color=$(color_threshold "$sig_abs" 60 75)
         put $((r+3)) "$c" "$C_WHITE" "$(printf 'Signal: %s%s dBm%s  Band: %s GHz  Ch: %s' "$sig_color" "$NET_WIFI_SIGNAL" "$C_RESET" "${NET_WIFI_BAND:-?}" "${NET_WIFI_CHANNEL:-?}")"
     else
         put $((r+3)) "$c" "$C_DIM" "Wired connection"
     fi
+    return 0
 }
 
 render_storage_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "STORAGE"
-
-    local pct_color
+    local pct_color opt_color
     pct_color=$(color_threshold "$STOR_ROOT_PCT" 75 90)
-    put $((r+1)) "$c" "$C_WHITE" "$(printf '/: %s%3d%%%s  %dG/%dG' "$pct_color" "$STOR_ROOT_PCT" "$C_RESET" "${STOR_ROOT_USED:-0}" "${STOR_ROOT_TOTAL:-0}")"
-    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Btrfs: %-6s Snaps: %d' "$STOR_BTRFS_STATUS" "$STOR_SNAP_COUNT")"
+    opt_color=$(color_count "$STOR_OPTS_OK" "${#EXPECT_FSTAB_OPTS[@]}")
+    put $((r+1)) "$c" "$C_WHITE" "$(printf '/: %s%3d%%%s  %dG/%dG  %s' "$pct_color" "$STOR_ROOT_PCT" "$C_RESET" "$STOR_ROOT_USED" "$STOR_ROOT_TOTAL" "$STOR_FSTYPE")"
+    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Mount opts: %s%d/%d%s  Sched: %s%s%s' "$opt_color" "$STOR_OPTS_OK" "${#EXPECT_FSTAB_OPTS[@]}" "$C_RESET" "$(color_expect "$STOR_SCHED" "$EXPECT_IO_SCHED")" "$STOR_SCHED" "$C_RESET")"
     put $((r+3)) "$c" "$C_WHITE" "$(printf 'IO: R %3d MB/s  W %3d MB/s' "$STOR_IO_READ" "$STOR_IO_WRITE")"
-    if [[ -n "$STOR_SNAP_LATEST" ]] && (( h > 4 )); then
-        put $((r+4)) "$c" "$C_DIM" "$(printf 'Last snap: %s' "$STOR_SNAP_LATEST")"
+    if [[ -n "$STOR_OPTS_MISSING" ]] && (( h > 4 )); then
+        put $((r+4)) "$c" "$C_YELLOW" "$(printf 'Missing: %s' "$STOR_OPTS_MISSING")"
     fi
+    return 0
 }
 
 render_systemd_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "SYSTEMD"
-
     local fail_color="$C_GREEN"
-    [[ $SYS_FAILED_COUNT -gt 0 ]] && fail_color="$C_RED"
-
+    (( SYS_FAILED_COUNT > 0 )) && fail_color="$C_RED"
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Failed: %s%d%s       Boot: %s' "$fail_color" "$SYS_FAILED_COUNT" "$C_RESET" "${SYS_BOOT_TIME:-?}")"
-    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Timers: %d active' "$SYS_TIMER_COUNT")"
-
-    if [[ $SYS_FAILED_COUNT -gt 0 ]] && (( h > 3 )); then
-        local unit
-        local row_off=3
+    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Profile: %s%d/%d%s active  %s%d/%d%s masked' \
+        "$(color_count "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}")" "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}" "$C_RESET" \
+        "$(color_count "$SYS_MASK_OK" "${#EXPECT_MASK[@]}")" "$SYS_MASK_OK" "${#EXPECT_MASK[@]}" "$C_RESET")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Timers: %d active' "$SYS_TIMER_COUNT")"
+    if (( SYS_FAILED_COUNT > 0 && h > 4 )); then
+        local unit row_off=4
         while IFS= read -r unit; do
-            [[ -z "$unit" ]] && continue
+            [[ -n "$unit" ]] || continue
             (( row_off >= h )) && break
             put $((r + row_off)) "$c" "$C_RED" "  ! ${unit:0:$((w-4))}"
-            ((row_off++))
+            row_off=$((row_off + 1))
         done <<< "$SYS_FAILED_UNITS"
     fi
+    return 0
 }
 
 render_thermal_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "THERMAL"
-
-    local pkg_color
-    pkg_color=$(color_threshold "$THERM_PACKAGE" 70 85)
+    local pkg_color tdp_color
+    pkg_color=$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
+    tdp_color=$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Package: %s%3d°C%s   Fan: %d RPM' "$pkg_color" "$THERM_PACKAGE" "$C_RESET" "$THERM_FAN")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf 'Core: %3d°C      SoC: %3dW' "$THERM_CORE" "$THERM_POWER_SOC")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Edge: %3d°C      GPU: %3dW  TDP: %dW' "$THERM_EDGE" "$THERM_POWER_CORE" "$THERM_TDP")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Edge: %3d°C      GPU: %3dW  TDP: %s%dW%s/%dW' "$THERM_EDGE" "$THERM_POWER_CORE" "$tdp_color" "$THERM_TDP" "$C_RESET" "$BIOS_PPT_CEILING")"
+    return 0
 }
 
-# ── Expanded panel renderers ─────────────────────────────────────────────
-
+# ── EXPANDED PANELS ──
 render_cpu_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "CPU — Detailed"
     local row=$((r+1)) i
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Average: %d MHz   Governor: %s   Boost: %s   Cores: %d' "$CPU_FREQ_AVG" "$CPU_GOVERNOR" "$CPU_BOOST" "$CPU_CORES")"
-    ((row++))
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Package Temp: %s%d°C%s' "$(color_threshold "$CPU_TEMP" 70 85)" "$CPU_TEMP" "$C_RESET")"
-    ((row++))
-
-    # CCD temps
+    put "$row" 2 "$C_WHITE" "$(printf 'Average:  %d MHz   Boost: %s   Cores: %d' "$CPU_FREQ_AVG" "$CPU_BOOST" "$CPU_CORES")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Driver:   %s%-16s%s expected %s' "$(color_expect "$CPU_DRIVER" "$EXPECT_SCALING_DRIVER")" "$CPU_DRIVER" "$C_RESET" "$EXPECT_SCALING_DRIVER")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Governor: %s%-16s%s expected %s' "$(color_expect "$CPU_GOVERNOR" "$EXPECT_GOVERNOR")" "$CPU_GOVERNOR" "$C_RESET" "$EXPECT_GOVERNOR")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'EPP:      %s%-16s%s expected %s' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$EXPECT_EPP")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Package:  %s%d°C%s (TjMax %d)' "$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$CPU_TEMP" "$C_RESET" "$BIOS_TJMAX")"; row=$((row+1))
     if (( ${#CPU_TEMPS[@]} > 1 )); then
         local tstr="CCD Temps:"
         for ((i = 1; i < ${#CPU_TEMPS[@]}; i++)); do
             tstr+="  CCD$((i-1)): ${CPU_TEMPS[$i]}°C"
         done
-        put "$row" 2 "$C_WHITE" "$tstr"
-        ((row++))
+        put "$row" 2 "$C_WHITE" "$tstr"; row=$((row+1))
     fi
-
-    ((row++))
-    put "$row" 2 "${C_BOLD}" "$(printf '%-6s %8s %6s %6s' 'Core' 'Freq' 'Load' 'Temp')"
-    ((row++))
-
-    for ((i = 0; i < CPU_CORES && row < max_h - 2; i++)); do
-        local lc
-        lc=$(color_threshold "${CPU_LOAD[$i]:-0}" 60 90)
-        put "$row" 2 "$C_WHITE" "$(printf 'cpu%-3d %5d MHz %s%4d%%%s' "$i" "${CPU_FREQS[$i]:-0}" "$lc" "${CPU_LOAD[$i]:-0}" "$C_RESET")"
-        ((row++))
-    done
+    if (( DETAIL_LEVEL == 1 )); then
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "$(printf '%-6s %8s %6s' 'Core' 'Freq' 'Load')"; row=$((row+1))
+        for ((i = 0; i < CPU_CORES && row < max_h - 2; i++)); do
+            put "$row" 2 "$C_WHITE" "$(printf 'cpu%-3d %5d MHz %s%4d%%%s' "$i" "${CPU_FREQS[$i]:-0}" "$(color_threshold "${CPU_LOAD[$i]:-0}" 60 90)" "${CPU_LOAD[$i]:-0}" "$C_RESET")"
+            row=$((row+1))
+        done
+    else
+        row=$((row+1))
+        put "$row" 2 "$C_DIM" "Press d for the per-core table."
+    fi
+    return 0
 }
 
 render_gpu_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "GPU — Detailed"
     local row=$((r+1))
-
     if [[ -z "$GPU_DRM" ]]; then
         put "$row" 2 "$C_DIM" "No AMD GPU detected"
-        return
+        return 0
     fi
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Shader Clock:  %s MHz' "$GPU_SCLK")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Memory Clock:  %s MHz' "$GPU_MCLK")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Busy:      %s%d%%%s' "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "$C_RESET")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Temperature:   %s%d°C%s' "$(color_threshold "$GPU_TEMP" 70 90)" "$GPU_TEMP" "$C_RESET")"; ((row++))
-
+    put "$row" 2 "$C_WHITE" "$(printf 'Shader Clock:  %s MHz' "$GPU_SCLK")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Memory Clock:  %s MHz' "$GPU_MCLK")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'GPU Busy:      %s%d%%%s' "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "$C_RESET")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Temperature:   %s%d°C%s' "$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$GPU_TEMP" "$C_RESET")"; row=$((row+1))
     local vram_pct=0
     (( GPU_VRAM_TOTAL > 0 )) && vram_pct=$(( GPU_VRAM_USED * 100 / GPU_VRAM_TOTAL ))
-    put "$row" 2 "$C_WHITE" "$(printf 'VRAM:          %d / %d MB (%d%%)' "$GPU_VRAM_USED" "$GPU_VRAM_TOTAL" "$vram_pct")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Power Draw:    %d W' "$GPU_POWER")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'DPM Level:     %s' "${GPU_DPM:-unknown}")"; ((row++))
+    put "$row" 2 "$C_WHITE" "$(printf 'VRAM:          %d / %d MB (%d%%)' "$GPU_VRAM_USED" "$GPU_VRAM_TOTAL" "$vram_pct")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Power Draw:    %d W' "$GPU_POWER")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'DPM Level:     %s%s%s (expected %s)' "$(color_expect "$GPU_DPM" "$EXPECT_GPU_DPM")" "${GPU_DPM:-unknown}" "$C_RESET" "$EXPECT_GPU_DPM")"; row=$((row+1))
+    if (( DETAIL_LEVEL == 1 )); then
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "DPM Tables"; row=$((row+1))
+        local f line
+        for f in pp_dpm_sclk pp_dpm_mclk; do
+            [[ -r "$GPU_DRM/$f" ]] || continue
+            put "$row" 2 "$C_DIM" "$f"; row=$((row+1))
+            while IFS= read -r line; do
+                (( row >= max_h - 2 )) && break
+                put "$row" 4 "$C_WHITE" "${line:0:$((w-6))}"
+                row=$((row+1))
+            done < "$GPU_DRM/$f"
+        done
+    fi
+    return 0
 }
 
 render_network_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "NETWORK — Detailed"
     local row=$((r+1))
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Interface:  %s' "${NET_IFACE:-none}")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'IP Address: %s' "${NET_IP:-?}")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'RX Rate:    %s' "$(fmt_rate "$NET_RX_RATE")")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'TX Rate:    %s' "$(fmt_rate "$NET_TX_RATE")")"; ((row++))
-
+    put "$row" 2 "$C_WHITE" "$(printf 'Interface:  %s' "${NET_IFACE:-none}")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'IP Address: %s' "${NET_IP:-?}")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'RX Rate:    %s' "$(fmt_rate "$NET_RX_RATE")")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'TX Rate:    %s' "$(fmt_rate "$NET_TX_RATE")")"; row=$((row+1))
     if [[ -n "$NET_WIFI_SIGNAL" ]]; then
-        ((row++))
-        put "$row" 2 "${C_BOLD}" "WiFi Details"; ((row++))
-        put "$row" 2 "$C_WHITE" "$(printf 'Signal:   %s dBm' "$NET_WIFI_SIGNAL")"; ((row++))
-        put "$row" 2 "$C_WHITE" "$(printf 'Band:     %s GHz' "${NET_WIFI_BAND:-?}")"; ((row++))
-        put "$row" 2 "$C_WHITE" "$(printf 'Channel:  %s' "${NET_WIFI_CHANNEL:-?}")"; ((row++))
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "Wi-Fi"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "$(printf 'Signal:     %s dBm' "$NET_WIFI_SIGNAL")"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "$(printf 'Band:       %s GHz' "${NET_WIFI_BAND:-?}")"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "$(printf 'Channel:    %s' "${NET_WIFI_CHANNEL:-?}")"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "$(printf 'Power save: %s%s%s (NM_WIFI_POWERSAVE %s = off)' "$(color_expect "${NET_POWERSAVE:-?}" off)" "${NET_POWERSAVE:-?}" "$C_RESET" "$EXPECT_WIFI_POWERSAVE")"; row=$((row+1))
     fi
-
-    # Per-interface summary
-    ((row++))
-    put "$row" 2 "${C_BOLD}" "$(printf '%-15s %10s %10s %6s' 'Interface' 'RX bytes' 'TX bytes' 'State')"; ((row++))
-    local iface
-    for iface in /sys/class/net/*; do
-        (( row >= max_h - 2 )) && break
-        local name="${iface##*/}"
-        [[ "$name" == "lo" ]] && continue
-        local state
-        state=$(read_sysfs "$iface/operstate" "?")
-        local rx_b tx_b
-        rx_b=$(read_sysfs "$iface/statistics/rx_bytes" 0)
-        tx_b=$(read_sysfs "$iface/statistics/tx_bytes" 0)
-        put "$row" 2 "$C_WHITE" "$(printf '%-15s %10d %10d %6s' "$name" "$rx_b" "$tx_b" "$state")"
-        ((row++))
-    done
+    if (( DETAIL_LEVEL == 1 )); then
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "$(printf '%-15s %14s %14s %6s' 'Interface' 'RX bytes' 'TX bytes' 'State')"; row=$((row+1))
+        local iface name state rx_b tx_b
+        for iface in /sys/class/net/*; do
+            (( row >= max_h - 2 )) && break
+            name="${iface##*/}"
+            [[ "$name" == "lo" ]] && continue
+            state=$(read_sysfs "$iface/operstate" '?')
+            rx_b=$(read_sysfs "$iface/statistics/rx_bytes" 0)
+            tx_b=$(read_sysfs "$iface/statistics/tx_bytes" 0)
+            put "$row" 2 "$C_WHITE" "$(printf '%-15s %14d %14d %6s' "$name" "$rx_b" "$tx_b" "$state")"
+            row=$((row+1))
+        done
+    fi
+    return 0
 }
 
 render_storage_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "STORAGE — Detailed"
     local row=$((r+1))
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Root:     %dG / %dG (%s%d%%%s)' "${STOR_ROOT_USED:-0}" "${STOR_ROOT_TOTAL:-0}" "$(color_threshold "$STOR_ROOT_PCT" 75 90)" "$STOR_ROOT_PCT" "$C_RESET")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Btrfs:    %s' "$STOR_BTRFS_STATUS")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'IO Read:  %d MB/s' "$STOR_IO_READ")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'IO Write: %d MB/s' "$STOR_IO_WRITE")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Snapshots: %d' "$STOR_SNAP_COUNT")"; ((row++))
-    [[ -n "$STOR_SNAP_LATEST" ]] && { put "$row" 2 "$C_WHITE" "$(printf 'Latest:    %s' "$STOR_SNAP_LATEST")"; ((row++)); }
+    put "$row" 2 "$C_WHITE" "$(printf 'Root:       %dG / %dG (%s%d%%%s)' "$STOR_ROOT_USED" "$STOR_ROOT_TOTAL" "$(color_threshold "$STOR_ROOT_PCT" 75 90)" "$STOR_ROOT_PCT" "$C_RESET")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Filesystem: %s' "$STOR_FSTYPE")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Device:     %s' "${STOR_DISK:-?}")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Scheduler:  %s%s%s (expected %s)' "$(color_expect "$STOR_SCHED" "$EXPECT_IO_SCHED")" "$STOR_SCHED" "$C_RESET" "$EXPECT_IO_SCHED")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Mount opts: %s%d/%d%s of %s' "$(color_count "$STOR_OPTS_OK" "${#EXPECT_FSTAB_OPTS[@]}")" "$STOR_OPTS_OK" "${#EXPECT_FSTAB_OPTS[@]}" "$C_RESET" "${EXPECT_FSTAB_OPTS[*]}")"; row=$((row+1))
+    if [[ -n "$STOR_OPTS_MISSING" ]]; then
+        put "$row" 2 "$C_YELLOW" "$(printf 'Missing:    %s — re-run ry-install to converge the fstab' "$STOR_OPTS_MISSING")"
+        row=$((row+1))
+    fi
+    put "$row" 2 "$C_WHITE" "$(printf 'IO Read:    %d MB/s' "$STOR_IO_READ")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'IO Write:   %d MB/s' "$STOR_IO_WRITE")"; row=$((row+1))
+    if (( DETAIL_LEVEL == 1 )); then
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "Mounted Filesystems"; row=$((row+1))
+        local line
+        while IFS= read -r line; do
+            (( row >= max_h - 2 )) && break
+            put "$row" 4 "$C_WHITE" "${line:0:$((w-6))}"
+            row=$((row+1))
+        done < <(findmnt -rno TARGET,FSTYPE,OPTIONS -t ext4,vfat 2>/dev/null || true)
+    fi
+    return 0
 }
 
 render_systemd_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "SYSTEMD — Detailed"
-    local row=$((r+1))
-
+    local row=$((r+1)) unit eline
     local fail_color="$C_GREEN"
-    [[ $SYS_FAILED_COUNT -gt 0 ]] && fail_color="$C_RED"
-
-    put "$row" 2 "$C_WHITE" "$(printf 'Failed Units: %s%d%s' "$fail_color" "$SYS_FAILED_COUNT" "$C_RESET")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Boot Time:    %s' "${SYS_BOOT_TIME:-?}")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Active Timers: %d' "$SYS_TIMER_COUNT")"; ((row++))
-
-    if [[ $SYS_FAILED_COUNT -gt 0 ]]; then
-        ((row++))
-        put "$row" 2 "${C_BOLD}${C_RED}" "Failed:"; ((row++))
-        local unit
+    (( SYS_FAILED_COUNT > 0 )) && fail_color="$C_RED"
+    put "$row" 2 "$C_WHITE" "$(printf 'Failed Units:  %s%d%s' "$fail_color" "$SYS_FAILED_COUNT" "$C_RESET")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Boot Time:     %s' "${SYS_BOOT_TIME:-?}")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Active Timers: %d' "$SYS_TIMER_COUNT")"; row=$((row+1))
+    row=$((row+1))
+    put "$row" 2 "$C_BOLD" "$(printf 'Profile Units (ry-install %s)' "$PROFILE_VERSION")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Enabled: %s%d/%d active%s' "$(color_count "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}")" "$SYS_SVC_OK" "${#EXPECT_SERVICES[@]}" "$C_RESET")"; row=$((row+1))
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        (( row >= max_h - 4 )) && break
+        put "$row" 4 "$C_YELLOW" "$unit"
+        row=$((row+1))
+    done <<< "$SYS_SVC_BAD"
+    put "$row" 2 "$C_WHITE" "$(printf 'Masked:  %s%d/%d masked%s' "$(color_count "$SYS_MASK_OK" "${#EXPECT_MASK[@]}")" "$SYS_MASK_OK" "${#EXPECT_MASK[@]}" "$C_RESET")"; row=$((row+1))
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        (( row >= max_h - 3 )) && break
+        put "$row" 4 "$C_YELLOW" "$unit"
+        row=$((row+1))
+    done <<< "$SYS_MASK_BAD"
+    if (( SYS_FAILED_COUNT > 0 )); then
+        row=$((row+1))
+        put "$row" 2 "${C_BOLD}${C_RED}" "Failed"; row=$((row+1))
         while IFS= read -r unit; do
-            [[ -z "$unit" ]] && continue
-            (( row >= max_h - 5 )) && break
+            [[ -n "$unit" ]] || continue
+            (( row >= max_h - 2 )) && break
             put "$row" 4 "$C_RED" "$unit"
-            ((row++))
+            row=$((row+1))
         done <<< "$SYS_FAILED_UNITS"
     fi
-
-    if [[ -n "$SYS_JOURNAL_ERRORS" ]]; then
-        ((row++))
-        put "$row" 2 "${C_BOLD}${C_YELLOW}" "Recent Errors (5 min):"; ((row++))
-        local eline
+    if (( DETAIL_LEVEL == 1 )) && [[ -n "$SYS_JOURNAL_ERRORS" ]]; then
+        row=$((row+1))
+        put "$row" 2 "${C_BOLD}${C_YELLOW}" "Recent Errors (5 min)"; row=$((row+1))
         while IFS= read -r eline; do
-            [[ -z "$eline" ]] && continue
+            [[ -n "$eline" ]] || continue
             (( row >= max_h - 2 )) && break
             put "$row" 4 "$C_YELLOW" "${eline:0:$((w-6))}"
-            ((row++))
+            row=$((row+1))
         done <<< "$SYS_JOURNAL_ERRORS"
     fi
+    return 0
 }
 
 render_thermal_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "THERMAL — Detailed"
     local row=$((r+1))
-
-    put "$row" 2 "${C_BOLD}" "Temperatures"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Package (Tctl): %s%3d°C%s' "$(color_threshold "$THERM_PACKAGE" 70 85)" "$THERM_PACKAGE" "$C_RESET")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Core (Tdie):    %3d°C' "$THERM_CORE")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Edge:       %3d°C' "$THERM_EDGE")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Junction:   %3d°C' "$THERM_GPU")"; ((row++))
-
-    ((row++))
-    put "$row" 2 "${C_BOLD}" "Power"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Core Power:     %3d W' "$THERM_POWER_CORE")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'SoC Power:      %3d W' "$THERM_POWER_SOC")"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'TDP Cap:        %3d W' "$THERM_TDP")"; ((row++))
-
-    ((row++))
-    put "$row" 2 "${C_BOLD}" "Cooling"; ((row++))
-    put "$row" 2 "$C_WHITE" "$(printf 'Fan Speed:      %d RPM' "$THERM_FAN")"; ((row++))
+    put "$row" 2 "$C_BOLD" "Temperatures"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Package (Tctl): %s%3d°C%s' "$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$THERM_PACKAGE" "$C_RESET")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Core (Tdie):    %3d°C' "$THERM_CORE")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'GPU Edge:       %3d°C' "$THERM_EDGE")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'GPU Junction:   %3d°C' "$THERM_GPU")"; row=$((row+1))
+    put "$row" 2 "$C_DIM" "$(printf 'BIOS TjMax:     %3d°C' "$BIOS_TJMAX")"; row=$((row+1))
+    row=$((row+1))
+    put "$row" 2 "$C_BOLD" "Power"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Core Power:     %3d W' "$THERM_POWER_CORE")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'SoC Power:      %3d W' "$THERM_POWER_SOC")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'TDP Cap:        %s%3d W%s' "$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))" "$THERM_TDP" "$C_RESET")"; row=$((row+1))
+    put "$row" 2 "$C_DIM" "$(printf 'BIOS ceiling:   %3d W flat SPL/fPPT/sPPT' "$BIOS_PPT_CEILING")"; row=$((row+1))
+    row=$((row+1))
+    put "$row" 2 "$C_BOLD" "Cooling"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Fan Speed:      %d RPM' "$THERM_FAN")"; row=$((row+1))
+    if (( DETAIL_LEVEL == 1 && ${#CPU_TEMPS[@]} > 1 )); then
+        row=$((row+1))
+        put "$row" 2 "$C_BOLD" "k10temp Sensors"; row=$((row+1))
+        local i
+        for ((i = 0; i < ${#CPU_TEMPS[@]} && row < max_h - 2; i++)); do
+            put "$row" 4 "$C_WHITE" "$(printf 'temp%d: %3d°C' "$((i+1))" "${CPU_TEMPS[$i]}")"
+            row=$((row+1))
+        done
+    fi
+    return 0
 }
 
-# ── Main renderers ────────────────────────────────────────────────────────
-
+# ── CHROME ──
 render_header() {
-    local now
+    local now i
     now=$(date +%H:%M:%S)
     local log_ind=""
-    [[ $LOG_ENABLED -eq 1 ]] && log_ind=" ${C_RED}●REC${C_RESET}"
-
-    # Title bar
+    (( LOG_ENABLED == 1 )) && log_ind=" ${C_RED}●REC${C_RESET}"
     goto 1 1
     printf '%s' "${C_BOLD}${C_BG_BLUE}${C_WHITE}"
     printf ' ry-dashboard v%s' "$VERSION"
-
-    # Panel tabs
     local panels=("OVR" "CPU" "GPU" "NET" "DISK" "SYS" "THERM")
-    local i
     for ((i = 0; i < ${#panels[@]}; i++)); do
-        if [[ $i -eq $FOCUSED_PANEL ]]; then
+        if (( i == FOCUSED_PANEL )); then
             printf ' %s[%s]%s%s' "$C_BOLD" "${panels[$i]}" "$C_RESET" "${C_BG_BLUE}${C_WHITE}"
         else
             printf '  %s ' "${panels[$i]}"
         fi
     done
-
-    # Right-align time + log indicator
     local right_str="$now "
     local pad_width=$((COLS - ${#right_str} - 5 - ${#panels[@]} * 7 - 25))
     (( pad_width > 0 )) && printf '%*s' "$pad_width" ""
     printf '%s%s' "$right_str" "$C_RESET"
     printf '%s' "$log_ind"
     printf '%s\e[K%s' "${C_BG_BLUE}" "$C_RESET"
+    return 0
 }
 
 render_footer() {
-    local row=$ROWS
-    goto "$row" 1
-    printf '%s' "${C_DIM}"
-    printf ' 0-6:panel  d:detail  l:log  r:refresh  +/-:interval(%ds)  q:quit\e[K' "$INTERVAL"
+    goto "$ROWS" 1
+    printf '%s' "$C_DIM"
+    printf ' 0-6:panel  d:detail(%d)  l:log  r:refresh  +/-:interval(%ds)  q:quit\e[K' "$DETAIL_LEVEL" "$INTERVAL"
     printf '%s' "$C_RESET"
+    return 0
 }
 
 render_statusbar() {
-    local row=$((ROWS - 1))
-    goto "$row" 1
-    printf '%s' "${C_BOLD}"
-
-    local load_avg
+    goto $((ROWS - 1)) 1
+    printf '%s' "$C_BOLD"
+    local load_avg fail_ind
     load_avg=$(cpu_load_avg)
-
-    local fail_ind=""
-    [[ $SYS_FAILED_COUNT -gt 0 ]] && fail_ind="${C_RED}${SYS_FAILED_COUNT}!${C_RESET}${C_BOLD}" || fail_ind="${C_GREEN}0${C_RESET}${C_BOLD}"
-
+    if (( SYS_FAILED_COUNT > 0 )); then
+        fail_ind="${C_RED}${SYS_FAILED_COUNT}!${C_RESET}${C_BOLD}"
+    else
+        fail_ind="${C_GREEN}0${C_RESET}${C_BOLD}"
+    fi
     printf ' CPU:%dMHz %s%d°C%s %s%d%%%s' \
         "$CPU_FREQ_AVG" \
-        "$(color_threshold "$CPU_TEMP" 70 85)" "$CPU_TEMP" "${C_RESET}${C_BOLD}" \
+        "$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$CPU_TEMP" "${C_RESET}${C_BOLD}" \
         "$(color_threshold "$load_avg" 60 90)" "$load_avg" "${C_RESET}${C_BOLD}"
-
     printf '  GPU:%sMHz %s%d°C%s %s%d%%%s' \
         "$GPU_SCLK" \
-        "$(color_threshold "$GPU_TEMP" 70 90)" "$GPU_TEMP" "${C_RESET}${C_BOLD}" \
+        "$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$GPU_TEMP" "${C_RESET}${C_BOLD}" \
         "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "${C_RESET}${C_BOLD}"
-
     printf '  NET:↓%s ↑%s' "$(fmt_rate "$NET_RX_RATE")" "$(fmt_rate "$NET_TX_RATE")"
-
     printf '  SYS:%s' "$fail_ind"
-
-    printf '  T:%s%d°C%s' "$(color_threshold "$THERM_PACKAGE" 70 85)" "$THERM_PACKAGE" "${C_RESET}${C_BOLD}"
-
+    printf '  PRF:%s%d/%d%s' \
+        "$(color_count $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )))" \
+        $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )) "${C_RESET}${C_BOLD}"
+    printf '  T:%s%d°C%s' "$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$THERM_PACKAGE" "${C_RESET}${C_BOLD}"
     printf '\e[K%s' "$C_RESET"
+    return 0
 }
 
 render_overview() {
@@ -1066,31 +1134,22 @@ render_overview() {
     local content_end=$((ROWS - 3))
     local avail_h=$((content_end - content_start))
     local half_w=$(( (COLS - 3) / 2 ))
-
-    # Panel heights: distribute evenly, 3 rows of 2 panels
     local panel_h=$((avail_h / 3))
     (( panel_h < 4 )) && panel_h=4
-
     local left_col=2
     local right_col=$((half_w + 3))
-
-    # Row 1: CPU | GPU
-    render_cpu_panel    "$content_start"                      "$left_col"  "$half_w" "$panel_h"
-    render_gpu_panel    "$content_start"                      "$right_col" "$half_w" "$panel_h"
-
-    # Row 2: THERMAL | NETWORK
-    render_thermal_panel $((content_start + panel_h))         "$left_col"  "$half_w" "$panel_h"
-    render_network_panel $((content_start + panel_h))         "$right_col" "$half_w" "$panel_h"
-
-    # Row 3: STORAGE | SYSTEMD
-    render_storage_panel $((content_start + panel_h * 2))     "$left_col"  "$half_w" "$panel_h"
-    render_systemd_panel $((content_start + panel_h * 2))     "$right_col" "$half_w" "$panel_h"
+    render_cpu_panel     "$content_start"                  "$left_col"  "$half_w" "$panel_h"
+    render_gpu_panel     "$content_start"                  "$right_col" "$half_w" "$panel_h"
+    render_thermal_panel $((content_start + panel_h))      "$left_col"  "$half_w" "$panel_h"
+    render_network_panel $((content_start + panel_h))      "$right_col" "$half_w" "$panel_h"
+    render_storage_panel $((content_start + panel_h * 2))  "$left_col"  "$half_w" "$panel_h"
+    render_systemd_panel $((content_start + panel_h * 2))  "$right_col" "$half_w" "$panel_h"
+    return 0
 }
 
 render_expanded() {
     local content_start=3
     local max_h=$((ROWS - 3))
-
     case "$FOCUSED_PANEL" in
         1) render_cpu_expanded     "$content_start" "$COLS" "$max_h" ;;
         2) render_gpu_expanded     "$content_start" "$COLS" "$max_h" ;;
@@ -1099,138 +1158,103 @@ render_expanded() {
         5) render_systemd_expanded "$content_start" "$COLS" "$max_h" ;;
         6) render_thermal_expanded "$content_start" "$COLS" "$max_h" ;;
     esac
+    return 0
 }
 
 render() {
     clear_content
     render_header
-
-    if [[ $FOCUSED_PANEL -eq 0 ]]; then
+    if (( FOCUSED_PANEL == 0 )); then
         render_overview
     else
         render_expanded
     fi
-
     render_statusbar
     render_footer
     NEED_REDRAW=0
+    return 0
 }
 
-# ── Input handler ─────────────────────────────────────────────────────────
+# ── INPUT HANDLER ──
 handle_input() {
-    local key="$1"
-
+    local key="$1" seq=""
     case "$key" in
-        q|Q)
-            RUNNING=0 ;;
-        0)
-            FOCUSED_PANEL=0; NEED_REDRAW=1 ;;
+        q|Q) RUNNING=0 ;;
+        0)   FOCUSED_PANEL=0; NEED_REDRAW=1 ;;
         [1-6])
-            if [[ $FOCUSED_PANEL -eq "$key" ]]; then
-                FOCUSED_PANEL=0  # Toggle back to overview
+            if (( FOCUSED_PANEL == key )); then
+                FOCUSED_PANEL=0
             else
                 FOCUSED_PANEL="$key"
             fi
             NEED_REDRAW=1 ;;
-        d|D)
-            DETAIL_LEVEL=$(( (DETAIL_LEVEL + 1) % 2 ))
-            NEED_REDRAW=1 ;;
+        d|D) DETAIL_LEVEL=$(( (DETAIL_LEVEL + 1) % 2 )); NEED_REDRAW=1 ;;
         l|L)
-            if [[ $LOG_ENABLED -eq 1 ]]; then
+            if (( LOG_ENABLED == 1 )); then
                 LOG_ENABLED=0
             else
                 LOG_ENABLED=1
                 log_init
             fi
             NEED_REDRAW=1 ;;
-        r|R)
-            LAST_COLLECT_MS=0  # Force refresh on next loop iteration
-            ;;
-        +|=)
-            (( INTERVAL < 10 )) && ((INTERVAL++))
-            NEED_REDRAW=1 ;;
-        -)
-            (( INTERVAL > 1 )) && ((INTERVAL--))
-            NEED_REDRAW=1 ;;
+        r|R) LAST_COLLECT_MS=0 ;;
+        +|=) (( INTERVAL < 10 )) && INTERVAL=$((INTERVAL + 1)); NEED_REDRAW=1 ;;
+        -)   (( INTERVAL > 1 )) && INTERVAL=$((INTERVAL - 1)); NEED_REDRAW=1 ;;
         $'\e')
-            # Escape key — could be escape sequence (arrows)
-            local seq=""
             read -rsn1 -t 0.05 seq || true
-            if [[ "$seq" == "[" ]]; then
-                read -rsn1 -t 0.05 seq || true
-                case "$seq" in
-                    A) ;; # Up — reserved for scroll
-                    B) ;; # Down — reserved for scroll
-                    C) ;; # Right
-                    D) ;; # Left
-                esac
-            else
-                # Plain Escape — return to overview
+            if [[ "$seq" != "[" ]]; then
                 FOCUSED_PANEL=0
                 NEED_REDRAW=1
-            fi
-            ;;
+            else
+                read -rsn1 -t 0.05 seq || true   # swallow the arrow final byte
+            fi ;;
     esac
+    return 0
 }
 
-# ── Cleanup ───────────────────────────────────────────────────────────────
+# ── CLEANUP ──
+# EXIT fires on every path, so preserve the status the script is exiting with
 cleanup() {
+    local status=$?
     RUNNING=0
     term_restore
-    exit 0
+    exit "$status"
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── MAIN ──
 main() {
     parse_args "$@"
     init_colors
-
-    # Minimum terminal size check
-    update_term_size
-    if (( COLS < 60 || ROWS < 20 )); then
-        echo "Error: terminal too small (need 60x20, have ${COLS}x${ROWS})" >&2
-        exit 1
-    fi
-
-    discover_hwmon
+    preflight
+    discover_hardware
     FOCUSED_PANEL=$START_PANEL
 
-    # Traps
     trap cleanup EXIT INT TERM
-    trap 'update_term_size' WINCH
+    trap update_term_size WINCH
 
     term_setup
     log_init
 
-    # Initial data collection (two rounds for deltas)
-    collect_all
+    collect_all          # two rounds seed the delta counters
     sleep 0.3
     collect_all
 
-    # Main loop
     local now_ms key=""
-    while [[ $RUNNING -eq 1 ]]; do
+    while (( RUNNING == 1 )); do
         now_ms=$(( $(date +%s%N) / 1000000 ))
-
-        # Collect data on interval
         if (( now_ms - LAST_COLLECT_MS >= INTERVAL * 1000 )); then
             collect_all
             log_row
             LAST_COLLECT_MS=$now_ms
             NEED_REDRAW=1
         fi
-
-        # Render if needed
-        if [[ $NEED_REDRAW -eq 1 ]]; then
-            render
-        fi
-
-        # Poll for input (0.2s timeout)
+        (( NEED_REDRAW == 1 )) && render
         key=""
         if read -rsn1 -t 0.2 key 2>/dev/null; then
             handle_input "$key"
         fi
     done
+    return 0
 }
 
 main "$@"
