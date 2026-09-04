@@ -3,6 +3,41 @@ Changes for ry-dashboard
 
 Newest first. Versioning is MAJOR.MINOR.PATCH.
 
+1.5.0
+-----
+
+  - profile: track ry-install and ry-verify 7.195.1; no tunable moved, the
+    pair's bump was verify-side only
+  - fix: read_sysfs redirected stderr after the read, so a sysfs read error
+    leaked bash text into the frame; the brace group carries the redirect
+  - fix: the raw $(< node) reads bypassed read_sysfs, and an empty read then
+    failed the arithmetic and set -e ended the TUI; every read goes through it
+  - fix: a left overview panel drew past its half into the right one; put
+    now clips every line at the panel edge, escapes carried uncounted
+  - fix: the header, status bar, and footer garbled their last column below
+    the width they assume; the bar drops whole fields, NET first, others clip
+  - thermal: drop the dead readouts: power2_average is no amdgpu node, and
+    power1_cap, fan1_input, junction temp2 are hidden on every APU
+  - thermal: Tdie read temp2_input, which k10temp exposes on no Strix Halo
+    part, and the CCD line named it CCD0; channels now resolve by _label
+  - thermal: headroom is the PPT draw against the 85 W BIOS ceiling, yellow
+    inside 10% of it and red 5 W over; cap and fan lines need their nodes
+  - gpu: label the power readout with amdgpu power1_label, PPT on an APU,
+    since the socket draw is not GPU-only power
+  - cpu: the nproc count reads CPUs, not Cores, on a 16C/32T part
+  - network: rediscover the interface when its carrier drops and reseed the
+    rate window, rather than following a dead link
+  - preflight: gate stty, df, nproc, date, findmnt, awk, and sed, the tools
+    README.md already said were gated; ip stays optional
+  - terminal: on a hung-up pty the restore printf failed under set -e ahead
+    of the 129 exit; the restore writes tolerate a dead tty
+  - logging: run log_init before the alternate screen so a create failure
+    stays readable, and drop the bash line-number noise beside it
+  - statusbar: drop the T: field, the same k10temp Tctl the CPU field shows
+  - readme: ip is optional, the TUI paints stdout, a missing tool exits 3,
+    the zero log columns on gfx1151, UTF-8 locale, clipping under 80 columns
+
+
 1.4.0
 -----
 

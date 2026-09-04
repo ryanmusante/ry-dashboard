@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# ry-dashboard v1.4.0 — CachyOS profile monitor for the Beelink GTR9 Pro (gfx1151)
+# ry-dashboard v1.5.0 — CachyOS profile monitor for the Beelink GTR9 Pro (gfx1151)
 set -euo pipefail
+shopt -s extglob   # the SGR-stripping pattern in put and sb_add needs *(...)
 
 # ── HEADER: VERSION + EXIT CODES ──
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly PROG="${0##*/}"
 readonly EXIT_OK=0 EXIT_FAIL=1 EXIT_USAGE=2 EXIT_PREFLIGHT=3
 
 # ── PROFILE EXPECTATIONS (LOCKSTEP WITH THE ry-install PAIR) ──
 # Every value below is carried by the pair — edit all three or readouts lie
-readonly PROFILE_VERSION="7.195.0"
+readonly PROFILE_VERSION="7.195.1"
 readonly EXPECT_SCALING_DRIVER="amd-pstate-epp"   # ry-verify EXPECTED_SCALING_DRIVER
 readonly EXPECT_GOVERNOR="performance"            # CPUPOWER_GOVERNOR
 readonly EXPECT_EPP="performance"                 # EPP_PREFERENCE
@@ -44,6 +45,10 @@ LAST_COLLECT_MS=0
 RUNNING=1
 TERM_STTY=""
 PROFILE_TICK=0
+PUT_EDGE=0              # last column put may paint; 0 = unclipped
+CLIPPED=""              # clip_visible result
+SB_OUT=""               # status bar under assembly
+SB_USED=0               # its visible width so far
 readonly PROFILE_EVERY=5   # unit tally costs 16 systemctl calls, poll it sparsely
 
 # ── CPU STATE ──
@@ -52,6 +57,8 @@ declare -a PREV_CPU_TOTAL=()
 declare -a CPU_LOAD=()
 declare -a CPU_FREQS=()
 declare -a CPU_TEMPS=()
+declare -a CPU_TEMP_NODES=()    # k10temp tempN_input paths, resolved once at discovery
+declare -a CPU_TEMP_LABELS=()   # their tempN_label: Tctl always, Tdie and Tccd* where the part has them
 CPU_FREQ_AVG=0
 CPU_TEMP=0
 CPU_GOVERNOR=""
@@ -70,6 +77,8 @@ GPU_VRAM_USED=0
 GPU_VRAM_TOTAL=0
 GPU_POWER=0
 GPU_DPM=""
+GPU_TEMP_LABEL="edge"   # amdgpu temp1_label; junction and mem are hidden on APUs
+GPU_POWER_LABEL="PPT"   # amdgpu power1_label; the socket draw on an APU, not GPU-only
 
 # ── NETWORK STATE ──
 NET_IFACE=""
@@ -112,14 +121,9 @@ SYS_MASK_OK=0
 SYS_MASK_BAD=""
 
 # ── THERMAL STATE ──
-THERM_PACKAGE=0
-THERM_CORE=0
-THERM_GPU=0
-THERM_EDGE=0
-THERM_FAN=0
-THERM_POWER_GPU=0
-THERM_POWER_SOC=0
-THERM_TDP=0
+# amdgpu hides fan1_input and power1_cap on APUs, so both stay empty on gfx1151
+THERM_FAN=""
+THERM_TDP=""
 
 # ── HWMON DISCOVERY CACHE ──
 HWMON_K10TEMP=""
@@ -254,6 +258,10 @@ hardware_gate() {
 preflight() {
     (( BASH_VERSINFO[0] >= 5 )) || die "$EXIT_PREFLIGHT" "bash 5 or newer required, found ${BASH_VERSION}"
     command -v tput >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "tput not found (install ncurses)"
+    local tool
+    for tool in stty df nproc date findmnt awk sed; do
+        command -v "$tool" >/dev/null 2>&1 || die "$EXIT_PREFLIGHT" "$tool not found"
+    done
     [[ -t 0 ]] || die "$EXIT_PREFLIGHT" "stdin is not a terminal"
     [[ -t 1 ]] || die "$EXIT_PREFLIGHT" "stdout is not a terminal"
     # Probe the capability without emitting it — a TERM without it cannot host the TUI
@@ -275,7 +283,7 @@ term_setup() {
 }
 
 term_restore() {
-    printf '\e[?7h'     # re-enable line wrap
+    printf '\e[?7h' 2>/dev/null || true   # re-enable line wrap; a hung-up tty makes this EIO
     if [[ -n "$TERM_STTY" ]]; then
         stty "$TERM_STTY" 2>/dev/null || true
     else
@@ -304,7 +312,7 @@ log_init() {
         LOG_PATH="$dir/$(date +%Y-%m-%d)-$$.$ext"
     fi
     # Log rows can carry host telemetry; keep the file owner-only
-    ( umask 0177 && : >> "$LOG_PATH" ) || { err "$PROG: cannot write $LOG_PATH"; LOG_ENABLED=0; return 0; }
+    ( umask 0177 && : >> "$LOG_PATH" ) 2>/dev/null || { err "$PROG: cannot write $LOG_PATH"; LOG_ENABLED=0; return 0; }
     if (( LOG_JSON == 0 )) && [[ ! -s "$LOG_PATH" ]]; then
         printf '%s\n' \
             "timestamp,cpu_freq_avg,cpu_temp,cpu_load,gpu_sclk,gpu_temp,gpu_busy,gpu_power,net_rx_rate,net_tx_rate,stor_root_pct,sys_failed,therm_package,therm_fan,therm_tdp" \
@@ -322,14 +330,14 @@ log_row() {
             "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "$(cpu_load_avg)" \
             "$GPU_SCLK" "$GPU_TEMP" "$GPU_BUSY" "$GPU_POWER" \
             "$NET_RX_RATE" "$NET_TX_RATE" "$STOR_ROOT_PCT" \
-            "$SYS_FAILED_COUNT" "$THERM_PACKAGE" "$THERM_FAN" "$THERM_TDP" \
+            "$SYS_FAILED_COUNT" "$CPU_TEMP" "${THERM_FAN:-0}" "${THERM_TDP:-0}" \
             >> "$LOG_PATH"
     else
         printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
             "$ts" "$CPU_FREQ_AVG" "$CPU_TEMP" "$(cpu_load_avg)" \
             "$GPU_SCLK" "$GPU_TEMP" "$GPU_BUSY" "$GPU_POWER" \
             "$NET_RX_RATE" "$NET_TX_RATE" "$STOR_ROOT_PCT" \
-            "$SYS_FAILED_COUNT" "$THERM_PACKAGE" "$THERM_FAN" "$THERM_TDP" \
+            "$SYS_FAILED_COUNT" "$CPU_TEMP" "${THERM_FAN:-0}" "${THERM_TDP:-0}" \
             >> "$LOG_PATH"
     fi
     return 0
@@ -338,8 +346,10 @@ log_row() {
 # ── SYSFS READS ──
 # Read a sysfs file with the builtin, never cat — this runs per core per tick
 read_sysfs() {
-    local file="$1" fallback="${2:-0}" val
-    if [[ -r "$file" ]] && val=$(< "$file") 2>/dev/null && [[ -n "$val" ]]; then
+    local file="$1" fallback="${2-0}" val
+    # The brace group carries the redirect: on a bare assignment bash applies it
+    # after the substitution has already written the read error to the frame
+    if [[ -r "$file" ]] && { val=$(< "$file"); } 2>/dev/null && [[ -n "$val" ]]; then
         printf '%s\n' "$val"
     else
         printf '%s\n' "$fallback"
@@ -373,6 +383,23 @@ discover_hardware() {
         fi
     done
     CPU_CORES=$(nproc 2>/dev/null) || CPU_CORES=0
+    # Channels resolve by label, never index: Strix Halo k10temp exposes Tctl alone,
+    # desktop parts add Tdie at temp2 and Tccd* after it
+    CPU_TEMP_NODES=()
+    CPU_TEMP_LABELS=()
+    local n node
+    if [[ -n "$HWMON_K10TEMP" ]]; then
+        for ((n = 1; n <= 16; n++)); do
+            node="$HWMON_K10TEMP/temp${n}_input"
+            [[ -r "$node" ]] || continue
+            CPU_TEMP_NODES+=("$node")
+            CPU_TEMP_LABELS+=("$(read_sysfs "${node%_input}_label" "temp$n")")
+        done
+    fi
+    if [[ -n "$HWMON_AMDGPU" ]]; then
+        GPU_TEMP_LABEL=$(read_sysfs "$HWMON_AMDGPU/temp1_label" edge)
+        GPU_POWER_LABEL=$(read_sysfs "$HWMON_AMDGPU/power1_label" PPT)
+    fi
     return 0
 }
 
@@ -390,14 +417,14 @@ collect_cpu() {
     done
     if (( freq_count > 0 )); then CPU_FREQ_AVG=$((freq_sum / freq_count)); else CPU_FREQ_AVG=0; fi
 
-    if [[ -n "$HWMON_K10TEMP" ]]; then
-        CPU_TEMP=$(( $(read_sysfs "$HWMON_K10TEMP/temp1_input" 0) / 1000 ))
-        CPU_TEMPS=("$CPU_TEMP")
-        for t in "$HWMON_K10TEMP"/temp{2,3,4,5}_input; do
-            [[ -r "$t" ]] || break
-            CPU_TEMPS+=("$(( $(< "$t") / 1000 ))")
-        done
-    fi
+    CPU_TEMPS=()
+    for t in "${CPU_TEMP_NODES[@]}"; do
+        CPU_TEMPS+=("$(( $(read_sysfs "$t" 0) / 1000 ))")
+    done
+    CPU_TEMP=${CPU_TEMPS[0]:-0}   # temp1 is Tctl on every k10temp part; the label confirms it
+    for ((i = 0; i < ${#CPU_TEMPS[@]}; i++)); do
+        if [[ "${CPU_TEMP_LABELS[$i]}" == "Tctl" ]]; then CPU_TEMP=${CPU_TEMPS[$i]}; break; fi
+    done
 
     CPU_GOVERNOR=$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor unknown)
     CPU_DRIVER=$(read_sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver unknown)
@@ -476,26 +503,37 @@ collect_gpu() {
     return 0
 }
 
-collect_network() {
+# First interface with carrier, else the first that is not lo
+net_pick_iface() {
     local iface name
-    if [[ -z "$NET_IFACE" ]]; then
-        for iface in /sys/class/net/*; do
-            name="${iface##*/}"
-            [[ "$name" == "lo" ]] && continue
-            if [[ "$(read_sysfs "$iface/carrier" 0)" == "1" ]]; then
-                NET_IFACE="$name"
-                break
-            fi
-        done
-        if [[ -z "$NET_IFACE" ]]; then
-            for iface in /sys/class/net/*; do
-                name="${iface##*/}"
-                if [[ "$name" != "lo" ]]; then
-                    NET_IFACE="$name"
-                    break
-                fi
-            done
+    NET_IFACE=""
+    for iface in /sys/class/net/*; do
+        name="${iface##*/}"
+        [[ "$name" == "lo" ]] && continue
+        if [[ "$(read_sysfs "$iface/carrier" 0)" == "1" ]]; then
+            NET_IFACE="$name"
+            return 0
         fi
+    done
+    for iface in /sys/class/net/*; do
+        name="${iface##*/}"
+        [[ "$name" == "lo" ]] && continue
+        NET_IFACE="$name"
+        return 0
+    done
+    return 0
+}
+
+collect_network() {
+    local prev_iface="$NET_IFACE"
+    # Follow the link: a carrier drop re-runs discovery rather than watching a dead port
+    if [[ -z "$NET_IFACE" || "$(read_sysfs "/sys/class/net/$NET_IFACE/carrier" 0)" != "1" ]]; then
+        net_pick_iface
+    fi
+    if [[ "$NET_IFACE" != "$prev_iface" ]]; then
+        PREV_NET_TIME=0   # reseed the rate window on a new interface
+        NET_RX_RATE=0
+        NET_TX_RATE=0
     fi
     [[ -n "$NET_IFACE" ]] || return 0
 
@@ -593,10 +631,10 @@ collect_storage() {
     STOR_SCHED="?"
     if [[ -n "$STOR_DISK" && -r "/sys/block/$STOR_DISK/queue/scheduler" ]]; then
         local sched
-        sched=$(< "/sys/block/$STOR_DISK/queue/scheduler")
+        sched=$(read_sysfs "/sys/block/$STOR_DISK/queue/scheduler" "")
         if [[ "$sched" =~ \[([a-z-]+)\] ]]; then
             STOR_SCHED="${BASH_REMATCH[1]}"
-        else
+        elif [[ -n "$sched" ]]; then
             STOR_SCHED="${sched%% *}"
         fi
     fi
@@ -688,19 +726,14 @@ collect_profile_units() {
     return 0
 }
 
+# Temperatures and the socket draw come from collect_cpu and collect_gpu; only the
+# nodes an APU may lack are read here, and stay empty when absent
 collect_thermal() {
-    if [[ -n "$HWMON_K10TEMP" ]]; then
-        THERM_PACKAGE=$(( $(read_sysfs "$HWMON_K10TEMP/temp1_input" 0) / 1000 ))
-        [[ -r "$HWMON_K10TEMP/temp2_input" ]] && THERM_CORE=$(( $(< "$HWMON_K10TEMP/temp2_input") / 1000 ))
-    fi
-    if [[ -n "$HWMON_AMDGPU" ]]; then
-        [[ -r "$HWMON_AMDGPU/temp1_input" ]] && THERM_EDGE=$(( $(< "$HWMON_AMDGPU/temp1_input") / 1000 ))
-        [[ -r "$HWMON_AMDGPU/temp2_input" ]] && THERM_GPU=$(( $(< "$HWMON_AMDGPU/temp2_input") / 1000 ))
-        THERM_FAN=$(read_sysfs "$HWMON_AMDGPU/fan1_input" 0)
-        [[ -r "$HWMON_AMDGPU/power1_average" ]] && THERM_POWER_GPU=$(( $(read_sysfs "$HWMON_AMDGPU/power1_average" 0) / 1000000 ))
-        [[ -r "$HWMON_AMDGPU/power2_average" ]] && THERM_POWER_SOC=$(( $(read_sysfs "$HWMON_AMDGPU/power2_average" 0) / 1000000 ))
-        [[ -r "$HWMON_AMDGPU/power1_cap" ]] && THERM_TDP=$(( $(read_sysfs "$HWMON_AMDGPU/power1_cap" 0) / 1000000 ))
-    fi
+    THERM_FAN=""
+    THERM_TDP=""
+    [[ -n "$HWMON_AMDGPU" ]] || return 0
+    [[ -r "$HWMON_AMDGPU/fan1_input" ]] && THERM_FAN=$(read_sysfs "$HWMON_AMDGPU/fan1_input" 0)
+    [[ -r "$HWMON_AMDGPU/power1_cap" ]] && THERM_TDP=$(( $(read_sysfs "$HWMON_AMDGPU/power1_cap" 0) / 1000000 ))
     return 0
 }
 
@@ -719,11 +752,61 @@ goto() { printf '\e[%d;%dH' "$1" "$2"; }
 
 clear_content() { printf '\e[2J\e[H'; }
 
+# PUT_EDGE bounds the paint: a grid line longer than its half would otherwise
+# run into the neighbouring panel, and past the last column it garbles it
 put() {
     local row=$1 col=$2 color=$3
     shift 3
+    local text="$*"
+    if (( PUT_EDGE > 0 )); then
+        local plain=${text//$'\e['*([0-9;])m/} avail=$((PUT_EDGE - col + 1))
+        (( avail > 0 )) || return 0
+        if (( ${#plain} > avail )); then
+            clip_visible "$text" "$avail"
+            text=$CLIPPED
+        fi
+    fi
     goto "$row" "$col"
-    printf '%s%s%s' "$color" "$*" "$C_RESET"
+    printf '%s%s%s' "$color" "$text" "$C_RESET"
+}
+
+# Cut text to n visible columns, carrying SGR escapes through uncounted
+clip_visible() {
+    local text=$1 n=$2 i=0 j seen=0 len
+    len=${#text}   # not on the local line: bash expands every local value before assigning any
+    CLIPPED=""
+    while (( i < len && seen < n )); do
+        if [[ "${text:i:1}" == $'\e' ]]; then
+            j=$i
+            while (( j < len )) && [[ "${text:j:1}" != "m" ]]; do j=$((j + 1)); done
+            CLIPPED+=${text:i:j-i+1}
+            i=$((j + 1))
+        else
+            CLIPPED+=${text:i:1}
+            i=$((i + 1))
+            seen=$((seen + 1))
+        fi
+    done
+    return 0
+}
+
+# Append a status-bar segment only while its visible width still fits COLS
+sb_add() {
+    local plain=${1//$'\e['*([0-9;])m/}
+    (( SB_USED + ${#plain} <= COLS )) || return 0
+    SB_OUT+=$1
+    SB_USED=$((SB_USED + ${#plain}))
+    return 0
+}
+
+# The k10temp channels beyond Tctl, labeled — empty on a part that exposes Tctl alone
+k10temp_extra() {
+    local i out=""
+    for ((i = 0; i < ${#CPU_TEMPS[@]}; i++)); do
+        [[ "${CPU_TEMP_LABELS[$i]}" == "Tctl" ]] && continue
+        out+="${out:+  }${CPU_TEMP_LABELS[$i]} ${CPU_TEMPS[$i]}°C"
+    done
+    printf '%s\n' "$out"
 }
 
 fmt_rate() {
@@ -785,7 +868,7 @@ render_cpu_panel() {
     tc=$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'Avg: %-5s MHz  Load: %s%3d%%%s' "$CPU_FREQ_AVG" "$(color_threshold "$load_avg" 60 90)" "$load_avg" "$C_RESET")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf 'Temp: %s%3d°C%s     Gov: %s%s%s' "$tc" "$CPU_TEMP" "$C_RESET" "$(color_expect "$CPU_GOVERNOR" "$EXPECT_GOVERNOR")" "$CPU_GOVERNOR" "$C_RESET")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'EPP: %s%-12s%s Cores: %d' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$CPU_CORES")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf 'EPP: %s%-12s%s CPUs: %d' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$CPU_CORES")"
     if (( h > 4 )); then
         local core_str="" i show
         show=$(( CPU_CORES < 8 ? CPU_CORES : 8 ))
@@ -812,7 +895,7 @@ render_gpu_panel() {
     fi
     put $((r+1)) "$c" "$C_WHITE" "$(printf 'SCLK: %-5s MHz  Busy: %s%3d%%%s' "$GPU_SCLK" "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "$C_RESET")"
     put $((r+2)) "$c" "$C_WHITE" "$(printf 'Temp: %s%3d°C%s     VRAM: %s' "$tc" "$GPU_TEMP" "$C_RESET" "$vram_gb")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Power: %3dW      DPM: %s%s%s' "$GPU_POWER" "$(color_expect "$GPU_DPM" "$EXPECT_GPU_DPM")" "${GPU_DPM:-?}" "$C_RESET")"
+    put $((r+3)) "$c" "$C_WHITE" "$(printf '%s: %3dW  DPM: %s%s%s' "$GPU_POWER_LABEL" "$GPU_POWER" "$(color_expect "$GPU_DPM" "$EXPECT_GPU_DPM")" "${GPU_DPM:-?}" "$C_RESET")"
     return 0
 }
 
@@ -873,15 +956,27 @@ render_systemd_panel() {
     return 0
 }
 
+# Yellow inside 10% of the BIOS ceiling (the cap is doing its job), red 5 W over it
+color_ppt() { color_threshold "$1" $((BIOS_PPT_CEILING * 9 / 10)) $((BIOS_PPT_CEILING + 5)); }
+
 render_thermal_panel() {
     local r=$1 c=$2 w=$3 h=$4
     render_panel_header "$r" "$c" "$w" "THERMAL"
-    local pkg_color tdp_color
-    pkg_color=$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
-    tdp_color=$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))
-    put $((r+1)) "$c" "$C_WHITE" "$(printf 'Package: %s%3d°C%s   Fan: %d RPM' "$pkg_color" "$THERM_PACKAGE" "$C_RESET" "$THERM_FAN")"
-    put $((r+2)) "$c" "$C_WHITE" "$(printf 'Core: %3d°C      SoC: %3dW' "$THERM_CORE" "$THERM_POWER_SOC")"
-    put $((r+3)) "$c" "$C_WHITE" "$(printf 'Edge: %3d°C      GPU: %3dW  TDP: %s%dW%s/%dW' "$THERM_EDGE" "$THERM_POWER_GPU" "$tdp_color" "$THERM_TDP" "$C_RESET" "$BIOS_PPT_CEILING")"
+    local tc gc line
+    tc=$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
+    gc=$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")
+    put $((r+1)) "$c" "$C_WHITE" "$(printf 'Tctl: %s%3d°C%s   GPU: %s%3d°C%s' "$tc" "$CPU_TEMP" "$C_RESET" "$gc" "$GPU_TEMP" "$C_RESET")"
+    line=$(printf '%s: %s%3dW%s/%dW' "$GPU_POWER_LABEL" "$(color_ppt "$GPU_POWER")" "$GPU_POWER" "$C_RESET" "$BIOS_PPT_CEILING")
+    [[ -n "$THERM_TDP" ]] && line+=$(printf '  Cap: %dW' "$THERM_TDP")
+    put $((r+2)) "$c" "$C_WHITE" "$line"
+    if (( ${#CPU_TEMPS[@]} > 1 )); then
+        put $((r+3)) "$c" "$C_WHITE" "$(k10temp_extra)"
+    else
+        put $((r+3)) "$c" "$C_DIM" "$(printf 'BIOS: TjMax %d°C  ceiling %dW' "$BIOS_TJMAX" "$BIOS_PPT_CEILING")"
+    fi
+    if [[ -n "$THERM_FAN" ]] && (( h > 4 )); then
+        put $((r+4)) "$c" "$C_WHITE" "$(printf 'Fan: %d RPM' "$THERM_FAN")"
+    fi
     return 0
 }
 
@@ -890,17 +985,13 @@ render_cpu_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "CPU — Detailed"
     local row=$((r+1)) i
-    put "$row" 2 "$C_WHITE" "$(printf 'Average:  %d MHz   Boost: %s%s%s   Cores: %d' "$CPU_FREQ_AVG" "$(color_expect "$CPU_BOOST" "$EXPECT_CPU_BOOST")" "$CPU_BOOST" "$C_RESET" "$CPU_CORES")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Average:  %d MHz   Boost: %s%s%s   CPUs: %d' "$CPU_FREQ_AVG" "$(color_expect "$CPU_BOOST" "$EXPECT_CPU_BOOST")" "$CPU_BOOST" "$C_RESET" "$CPU_CORES")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'Driver:   %s%-16s%s expected %s' "$(color_expect "$CPU_DRIVER" "$EXPECT_SCALING_DRIVER")" "$CPU_DRIVER" "$C_RESET" "$EXPECT_SCALING_DRIVER")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'Governor: %s%-16s%s expected %s' "$(color_expect "$CPU_GOVERNOR" "$EXPECT_GOVERNOR")" "$CPU_GOVERNOR" "$C_RESET" "$EXPECT_GOVERNOR")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'EPP:      %s%-16s%s expected %s' "$(color_expect "$CPU_EPP" "$EXPECT_EPP")" "$CPU_EPP" "$C_RESET" "$EXPECT_EPP")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Package:  %s%d°C%s (TjMax %d)' "$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$CPU_TEMP" "$C_RESET" "$BIOS_TJMAX")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf 'Tctl:     %s%d°C%s (TjMax %d)' "$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$CPU_TEMP" "$C_RESET" "$BIOS_TJMAX")"; row=$((row+1))
     if (( ${#CPU_TEMPS[@]} > 1 )); then
-        local tstr="CCD Temps:"
-        for ((i = 1; i < ${#CPU_TEMPS[@]}; i++)); do
-            tstr+="  CCD$((i-1)): ${CPU_TEMPS[$i]}°C"
-        done
-        put "$row" 2 "$C_WHITE" "$tstr"; row=$((row+1))
+        put "$row" 2 "$C_WHITE" "k10temp:  $(k10temp_extra)"; row=$((row+1))
     fi
     if (( DETAIL_LEVEL == 1 )); then
         row=$((row+1))
@@ -931,7 +1022,7 @@ render_gpu_expanded() {
     local vram_pct=0
     (( GPU_VRAM_TOTAL > 0 )) && vram_pct=$(( GPU_VRAM_USED * 100 / GPU_VRAM_TOTAL ))
     put "$row" 2 "$C_WHITE" "$(printf 'VRAM:          %d / %d MB (%d%%)' "$GPU_VRAM_USED" "$GPU_VRAM_TOTAL" "$vram_pct")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Power Draw:    %d W' "$GPU_POWER")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf '%-15s%d W' "$GPU_POWER_LABEL draw:" "$GPU_POWER")"; row=$((row+1))
     put "$row" 2 "$C_WHITE" "$(printf 'DPM Level:     %s%s%s (expected %s)' "$(color_expect "$GPU_DPM" "$EXPECT_GPU_DPM")" "${GPU_DPM:-unknown}" "$C_RESET" "$EXPECT_GPU_DPM")"; row=$((row+1))
     if (( DETAIL_LEVEL == 1 )); then
         row=$((row+1))
@@ -1063,28 +1154,40 @@ render_systemd_expanded() {
 render_thermal_expanded() {
     local r=$1 w=$2 max_h=$3
     render_panel_header "$r" 2 "$((w-2))" "THERMAL — Detailed"
-    local row=$((r+1))
+    local row=$((r+1)) i node
     put "$row" 2 "$C_BOLD" "Temperatures"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Package (Tctl): %s%3d°C%s' "$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$THERM_PACKAGE" "$C_RESET")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Core (Tdie):    %3d°C' "$THERM_CORE")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Edge:       %3d°C' "$THERM_EDGE")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Junction:   %3d°C' "$THERM_GPU")"; row=$((row+1))
-    put "$row" 2 "$C_DIM" "$(printf 'BIOS TjMax:     %3d°C' "$BIOS_TJMAX")"; row=$((row+1))
+    for ((i = 0; i < ${#CPU_TEMPS[@]}; i++)); do
+        put "$row" 2 "$C_WHITE" "$(printf '%-16s%s%3d°C%s' "${CPU_TEMP_LABELS[$i]} (k10temp):" "$(color_threshold "${CPU_TEMPS[$i]}" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "${CPU_TEMPS[$i]}" "$C_RESET")"; row=$((row+1))
+    done
+    if [[ -n "$GPU_DRM" ]]; then
+        put "$row" 2 "$C_WHITE" "$(printf '%-16s%s%3d°C%s' "GPU $GPU_TEMP_LABEL:" "$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$GPU_TEMP" "$C_RESET")"; row=$((row+1))
+    fi
+    put "$row" 2 "$C_DIM" "$(printf '%-16s%3d°C' 'BIOS TjMax:' "$BIOS_TJMAX")"; row=$((row+1))
     row=$((row+1))
     put "$row" 2 "$C_BOLD" "Power"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'GPU Power:      %3d W' "$THERM_POWER_GPU")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'SoC Power:      %3d W' "$THERM_POWER_SOC")"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'TDP Cap:        %s%3d W%s' "$(color_threshold "$THERM_TDP" $((BIOS_PPT_CEILING + 1)) $((BIOS_PPT_CEILING + 20)))" "$THERM_TDP" "$C_RESET")"; row=$((row+1))
-    put "$row" 2 "$C_DIM" "$(printf 'BIOS ceiling:   %3d W flat SPL/fPPT/sPPT' "$BIOS_PPT_CEILING")"; row=$((row+1))
+    put "$row" 2 "$C_WHITE" "$(printf '%-16s%s%3d W%s / %d W ceiling' "$GPU_POWER_LABEL draw:" "$(color_ppt "$GPU_POWER")" "$GPU_POWER" "$C_RESET" "$BIOS_PPT_CEILING")"; row=$((row+1))
+    if [[ -n "$THERM_TDP" ]]; then
+        put "$row" 2 "$C_WHITE" "$(printf '%-16s%3d W' "$GPU_POWER_LABEL cap:" "$THERM_TDP")"
+    else
+        put "$row" 2 "$C_DIM" "$(printf '%-16snot exported by amdgpu on an APU' "$GPU_POWER_LABEL cap:")"
+    fi
+    row=$((row+1))
+    put "$row" 2 "$C_DIM" "$(printf '%-16s%3d W flat SPL/fPPT/sPPT' 'BIOS ceiling:' "$BIOS_PPT_CEILING")"; row=$((row+1))
     row=$((row+1))
     put "$row" 2 "$C_BOLD" "Cooling"; row=$((row+1))
-    put "$row" 2 "$C_WHITE" "$(printf 'Fan Speed:      %d RPM' "$THERM_FAN")"; row=$((row+1))
-    if (( DETAIL_LEVEL == 1 && ${#CPU_TEMPS[@]} > 1 )); then
+    if [[ -n "$THERM_FAN" ]]; then
+        put "$row" 2 "$C_WHITE" "$(printf '%-16s%d RPM' 'Fan:' "$THERM_FAN")"
+    else
+        put "$row" 2 "$C_DIM" "$(printf '%-16sno amdgpu fan node on an APU' 'Fan:')"
+    fi
+    row=$((row+1))
+    if (( DETAIL_LEVEL == 1 )) && [[ -n "$HWMON_AMDGPU" ]]; then
         row=$((row+1))
-        put "$row" 2 "$C_BOLD" "k10temp Sensors"; row=$((row+1))
-        local i
-        for ((i = 0; i < ${#CPU_TEMPS[@]} && row < max_h - 2; i++)); do
-            put "$row" 4 "$C_WHITE" "$(printf 'temp%d: %3d°C' "$((i+1))" "${CPU_TEMPS[$i]}")"
+        put "$row" 2 "$C_BOLD" "amdgpu hwmon voltages"; row=$((row+1))
+        for node in "$HWMON_AMDGPU"/in[0-9]_input; do
+            (( row >= max_h - 2 )) && break
+            [[ -r "$node" ]] || continue
+            put "$row" 4 "$C_WHITE" "$(printf '%-12s%s mV' "$(read_sysfs "${node%_input}_label" "${node##*/}"):" "$(read_sysfs "$node" '?')")"
             row=$((row+1))
         done
     fi
@@ -1093,44 +1196,41 @@ render_thermal_expanded() {
 
 # ── CHROME ──
 render_header() {
-    local now i
+    local now i panels=("OVR" "CPU" "GPU" "NET" "DISK" "SYS" "THERM")
     now=$(date +%H:%M:%S)
-    local log_ind=""
-    (( LOG_ENABLED == 1 )) && log_ind=" ${C_RED}●REC${C_RESET}"
-    goto 1 1
-    printf '%s' "${C_BOLD}${C_BG_BLUE}${C_WHITE}"
-    printf ' ry-dashboard v%s' "$VERSION"
-    local panels=("OVR" "CPU" "GPU" "NET" "DISK" "SYS" "THERM")
-    local used=$(( 15 + ${#VERSION} ))   # width of the title run above
+    local left="${C_BOLD}${C_BG_BLUE}${C_WHITE} ry-dashboard v${VERSION}"
+    local used=$(( 15 + ${#VERSION} ))   # visible width of the title run
     for ((i = 0; i < ${#panels[@]}; i++)); do
         used=$(( used + ${#panels[$i]} + 3 ))   # both arms print 3 + label
         if (( i == FOCUSED_PANEL )); then
-            printf ' %s[%s]%s%s' "$C_BOLD" "${panels[$i]}" "$C_RESET" "${C_BG_BLUE}${C_WHITE}"
+            left+=" ${C_BOLD}[${panels[$i]}]${C_RESET}${C_BG_BLUE}${C_WHITE}"
         else
-            printf '  %s ' "${panels[$i]}"
+            left+="  ${panels[$i]} "
         fi
     done
-    local right_str="$now "
-    (( LOG_ENABLED == 1 )) && used=$((used + 5))   # the ●REC indicator
-    local pad_width=$((COLS - used - ${#right_str}))
-    (( pad_width > 0 )) && printf '%*s' "$pad_width" ""
-    printf '%s%s' "$right_str" "$C_RESET"
-    printf '%s' "$log_ind"
+    local right="$now " rec="" rec_w=0
+    if (( LOG_ENABLED == 1 )); then rec=" ${C_RED}●REC${C_RESET}"; rec_w=5; fi
+    goto 1 1
+    if (( used + ${#right} + rec_w <= COLS )); then
+        printf '%s%*s%s%s%s' "$left" $((COLS - used - ${#right} - rec_w)) "" "$right" "$C_RESET" "$rec"
+    else
+        clip_visible "$left" "$COLS"   # too narrow for the clock: keep the panel strip
+        printf '%s%s' "$CLIPPED" "$C_RESET"
+    fi
     printf '%s\e[K%s' "${C_BG_BLUE}" "$C_RESET"
     return 0
 }
 
 render_footer() {
+    local text
+    printf -v text ' 0-6:panel  d:detail(%d)  l:log  r:refresh  +/-:interval(%ds)  q:quit' "$DETAIL_LEVEL" "$INTERVAL"
     goto "$ROWS" 1
-    printf '%s' "$C_DIM"
-    printf ' 0-6:panel  d:detail(%d)  l:log  r:refresh  +/-:interval(%ds)  q:quit\e[K' "$DETAIL_LEVEL" "$INTERVAL"
-    printf '%s' "$C_RESET"
+    printf '%s%s\e[K%s' "$C_DIM" "${text:0:COLS}" "$C_RESET"
     return 0
 }
 
+# Segments join in priority order and stop at the first that would not fit COLS
 render_statusbar() {
-    goto $((ROWS - 1)) 1
-    printf '%s' "$C_BOLD"
     local load_avg fail_ind
     load_avg=$(cpu_load_avg)
     if (( SYS_PRESENT == 0 )); then
@@ -1140,25 +1240,27 @@ render_statusbar() {
     else
         fail_ind="${C_GREEN}0${C_RESET}${C_BOLD}"
     fi
-    printf ' CPU:%dMHz %s%d°C%s %s%d%%%s' \
+    SB_OUT="$C_BOLD"
+    SB_USED=0
+    sb_add "$(printf ' CPU:%dMHz %s%d°C%s %s%d%%%s' \
         "$CPU_FREQ_AVG" \
         "$(color_threshold "$CPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$CPU_TEMP" "${C_RESET}${C_BOLD}" \
-        "$(color_threshold "$load_avg" 60 90)" "$load_avg" "${C_RESET}${C_BOLD}"
-    printf '  GPU:%sMHz %s%d°C%s %s%d%%%s' \
+        "$(color_threshold "$load_avg" 60 90)" "$load_avg" "${C_RESET}${C_BOLD}")"
+    sb_add "$(printf '  GPU:%sMHz %s%d°C%s %s%d%%%s' \
         "$GPU_SCLK" \
         "$(color_threshold "$GPU_TEMP" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$GPU_TEMP" "${C_RESET}${C_BOLD}" \
-        "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "${C_RESET}${C_BOLD}"
-    printf '  NET:↓%s ↑%s' "$(fmt_rate "$NET_RX_RATE")" "$(fmt_rate "$NET_TX_RATE")"
-    printf '  SYS:%s' "$fail_ind"
+        "$(color_threshold "$GPU_BUSY" 60 90)" "$GPU_BUSY" "${C_RESET}${C_BOLD}")"
+    sb_add "$(printf '  SYS:%s' "$fail_ind")"
     if (( SYS_PRESENT == 1 )); then
-        printf '  PRF:%s%d/%d%s' \
+        sb_add "$(printf '  PRF:%s%d/%d%s' \
             "$(color_count $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )))" \
-            $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )) "${C_RESET}${C_BOLD}"
+            $((SYS_SVC_OK + SYS_MASK_OK)) $(( ${#EXPECT_SERVICES[@]} + ${#EXPECT_MASK[@]} )) "${C_RESET}${C_BOLD}")"
     else
-        printf '  PRF:%s?%s' "$C_DIM" "${C_RESET}${C_BOLD}"
+        sb_add "$(printf '  PRF:%s?%s' "$C_DIM" "${C_RESET}${C_BOLD}")"
     fi
-    printf '  T:%s%d°C%s' "$(color_threshold "$THERM_PACKAGE" $((BIOS_TJMAX - 20)) "$BIOS_TJMAX")" "$THERM_PACKAGE" "${C_RESET}${C_BOLD}"
-    printf '\e[K%s' "$C_RESET"
+    sb_add "$(printf '  NET:↓%s ↑%s' "$(fmt_rate "$NET_RX_RATE")" "$(fmt_rate "$NET_TX_RATE")")"   # lowest priority: the widest field
+    goto $((ROWS - 1)) 1
+    printf '%s\e[K%s' "$SB_OUT" "$C_RESET"
     return 0
 }
 
@@ -1171,18 +1273,22 @@ render_overview() {
     (( panel_h < 4 )) && panel_h=4
     local left_col=2
     local right_col=$((half_w + 3))
+    PUT_EDGE=$((left_col + half_w - 1))   # a left panel stops short of the right column
     render_cpu_panel     "$content_start"                  "$left_col"  "$half_w" "$panel_h"
-    render_gpu_panel     "$content_start"                  "$right_col" "$half_w" "$panel_h"
     render_thermal_panel $((content_start + panel_h))      "$left_col"  "$half_w" "$panel_h"
-    render_network_panel $((content_start + panel_h))      "$right_col" "$half_w" "$panel_h"
     render_storage_panel $((content_start + panel_h * 2))  "$left_col"  "$half_w" "$panel_h"
+    PUT_EDGE=$COLS
+    render_gpu_panel     "$content_start"                  "$right_col" "$half_w" "$panel_h"
+    render_network_panel $((content_start + panel_h))      "$right_col" "$half_w" "$panel_h"
     render_systemd_panel $((content_start + panel_h * 2))  "$right_col" "$half_w" "$panel_h"
+    PUT_EDGE=0
     return 0
 }
 
 render_expanded() {
     local content_start=3
     local max_h=$((ROWS - 3))
+    PUT_EDGE=$COLS
     case "$FOCUSED_PANEL" in
         1) render_cpu_expanded     "$content_start" "$COLS" "$max_h" ;;
         2) render_gpu_expanded     "$content_start" "$COLS" "$max_h" ;;
@@ -1191,6 +1297,7 @@ render_expanded() {
         5) render_systemd_expanded "$content_start" "$COLS" "$max_h" ;;
         6) render_thermal_expanded "$content_start" "$COLS" "$max_h" ;;
     esac
+    PUT_EDGE=0
     return 0
 }
 
@@ -1270,6 +1377,7 @@ main() {
     preflight
     discover_hardware
     FOCUSED_PANEL=$START_PANEL
+    log_init             # before the alternate screen, so a create failure stays readable
 
     trap cleanup EXIT
     trap 'on_signal 1' HUP
@@ -1278,7 +1386,6 @@ main() {
     trap update_term_size WINCH
 
     term_setup
-    log_init
 
     collect_all          # two rounds seed the delta counters
     sleep 0.3

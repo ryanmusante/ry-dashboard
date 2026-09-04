@@ -1,6 +1,6 @@
 # ry-dashboard
 
-**Version 1.4.0** · [Changelog](CHANGELOG.md)
+**Version 1.5.0** · [Changelog](CHANGELOG.md)
 
 Read-only terminal monitor for the CachyOS profile [ry-install](https://github.com/ryanmusante/ry-install) deploys on the Beelink GTR9 Pro (Ryzen AI Max+ 395 / gfx1151 / Strix Halo). `ry-dashboard.bash` reads sysfs, `/proc`, and `systemctl` on a timer and paints six panels, coloring each live value against the tunable [ry-install](https://github.com/ryanmusante/ry-install) actually deploys — a glance at profile state between runs, not a substitute for [ry-verify](https://github.com/ryanmusante/ry-verify), which is the audit.
 
@@ -26,16 +26,16 @@ The overview grid opens on launch; `1`-`6` expand a panel and `q` quits — see 
 |---|---|
 | OS | Linux with sysfs; CachyOS with the [ry-install](https://github.com/ryanmusante/ry-install) profile deployed |
 | Shell | bash 5.0 or newer |
-| Terminal | at least 60x20, `TERM` with an alternate screen (`smcup`) |
+| Terminal | at least 60x20, `TERM` with an alternate screen (`smcup`), a UTF-8 locale |
 | Hardware | CPU matching `Ryzen AI Max` — bypass via [Environment Overrides](#environment-overrides) |
 | Privileges | normal user; no `sudo`, no writes outside the log directory |
-| Tools | GNU coreutils (`stty`, `df`, `nproc`, `date`), `tput` (ncurses), `findmnt` (util-linux), `ip` (iproute2), `awk`, `sed` |
+| Tools | GNU coreutils (`stty`, `df`, `nproc`, `date`), `tput` (ncurses), `findmnt` (util-linux), `awk`, `sed` |
 
-Optional and degraded gracefully when absent: `systemctl` and `systemd-analyze` blank the Systemd panel, `journalctl` drops the recent-errors block, `iw` drops the Wi-Fi band, channel, and power-save readouts, `ip` blanks the IP address, and a missing GPU blanks the GPU panel. The GPU is discovered, not gated — an absent one is not a preflight failure.
+Optional and degraded gracefully when absent: `systemctl` and `systemd-analyze` blank the Systemd panel, `journalctl` drops the recent-errors block, `iw` drops the Wi-Fi band, channel, and power-save readouts, `ip` (iproute2) blanks the IP address, and a missing GPU blanks the GPU panel. The GPU is discovered, not gated — an absent one is not a preflight failure.
 
 ## Usage
 
-The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` opens straight into an expanded panel and `--interval <1-10>` sets the tick. `--log` starts CSV logging, `--json` switches that to JSONL. Positional arguments and unknown options exit `2`. `--help` (`-h`) and `--version` (`-v`) are the only stdout output — every diagnostic goes to stderr.
+The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` opens straight into an expanded panel and `--interval <1-10>` sets the tick. `--log` starts CSV logging, `--json` switches that to JSONL. Positional arguments and unknown options exit `2`. `--help` (`-h`) and `--version` (`-v`) print to stdout and exit; the TUI itself paints stdout, and every diagnostic goes to stderr.
 
 | Flag | Effect |
 |---|---|
@@ -44,7 +44,7 @@ The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` 
 | `-l, --log [PATH]` | enable logging; bare form uses the default path |
 | `--json` | log JSONL instead of CSV |
 | `--no-color` | disable colored output |
-| `-v, --version` | print `v1.4.0` and exit |
+| `-v, --version` | print `v1.5.0` and exit |
 | `-h, --help` | print help and exit |
 
 ## Exit Codes
@@ -56,7 +56,7 @@ The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` 
 | `0` | OK — clean quit |
 | `1` | a runtime failure; the terminal could not be taken over |
 | `2` | bad arguments, a positional argument, an out-of-range value |
-| `3` | preflight — old bash, missing `tput`, no tty, no alternate screen, terminal below 60x20, CPU gate mismatch |
+| `3` | preflight — old bash, a missing tool, no tty, no alternate screen, terminal below 60x20, CPU gate mismatch |
 
 `INT`, `TERM`, and `HUP` exit `128+N` — `130`, `143`, and `129` — the signal convention `ry-install.fish` and `ry-verify.fish` certify.
 
@@ -71,7 +71,7 @@ The bare invocation is the overview grid at a 2-second refresh. `--panel <0-6>` 
 
 ## Panels
 
-Six panels, two per row in the overview grid, each expandable. `d` toggles the detail block inside an expanded panel.
+Six panels, two per row in the overview grid, each expandable. `d` toggles the detail block inside an expanded panel. Below 80 columns a grid line longer than its half is clipped at the panel edge — the expanded panel carries the full line — and the status bar drops its lowest-priority fields, network rates first, rather than overrunning the last column.
 
 | Panel | Sources | Profile readouts |
 |---|---|---|
@@ -80,9 +80,9 @@ Six panels, two per row in the overview grid, each expandable. `d` toggles the d
 | Network | `/sys/class/net/*/statistics/`, `/proc/net/wireless`, `ip`, `iw` | Wi-Fi power save |
 | Storage | `df`, `findmnt`, `/proc/diskstats`, `/sys/block/*/queue/` | fstab options, NVMe scheduler |
 | Systemd | `systemctl`, `systemd-analyze`, `journalctl` | enabled and masked unit tallies, refreshed every 5th tick |
-| Thermal | `k10temp` and `amdgpu` hwmon | TjMax and PPT ceiling headroom |
+| Thermal | `k10temp` and `amdgpu` hwmon | `Tctl` against TjMax, `PPT` draw against the BIOS ceiling |
 
-Every hwmon path is discovered by name, never by index, so a reshuffle across boots cannot point a readout at the wrong sensor. The GPU is found by AMD vendor ID `0x1002`.
+Every hwmon path is discovered by name, never by index, so a reshuffle across boots cannot point a readout at the wrong sensor. The GPU is found by AMD vendor ID `0x1002`. Temperature and power channels resolve by their `_label`: Strix Halo `k10temp` exposes `Tctl` alone, desktop parts add `Tdie` and `Tccd*`, and the CPU and Thermal panels list whatever is present under those names. `amdgpu` hides the fan, the power cap, and the junction and memory temperatures on every APU, so on gfx1151 those readouts are omitted rather than shown as `0`; the socket draw it does export is labelled `PPT`, the power the BIOS ceiling caps.
 
 ### Keybinds
 
@@ -99,7 +99,7 @@ Every hwmon path is discovered by name, never by index, so a reshuffle across bo
 ## Profile Baseline
 
 > [!CAUTION]
-> The values below are carried verbatim from `ry-install.fish` 7.195.0. Bump this repo whenever the deployed tunables change, or the dashboard colors correct state as drift. `PROFILE_VERSION` at the top of the script names the release it tracks.
+> The values below are carried verbatim from `ry-install.fish` 7.195.1. Bump this repo whenever the deployed tunables change, or the dashboard colors correct state as drift. `PROFILE_VERSION` at the top of the script names the release it tracks.
 
 A green readout means the live value equals what [ry-install](https://github.com/ryanmusante/ry-install) deploys; yellow means it does not. The dashboard only reports — re-run `ry-install.fish` to converge, and [ry-verify](https://github.com/ryanmusante/ry-verify) for the authoritative check.
 
@@ -132,7 +132,7 @@ Logging is off by default. `--log` writes one row per refresh tick; `l` toggles 
 | CSV columns | `timestamp,cpu_freq_avg,cpu_temp,cpu_load,gpu_sclk,gpu_temp,gpu_busy,gpu_power,net_rx_rate,net_tx_rate,stor_root_pct,sys_failed,therm_package,therm_fan,therm_tdp` |
 | JSONL | one object per line keyed by the CSV column names, via `--json` |
 
-The PID in the filename keeps two concurrent instances from interleaving rows into one file.
+The PID in the filename keeps two concurrent instances from interleaving rows into one file. `gpu_power` is `amdgpu` `power1`, the socket (`PPT`) draw on an APU. `therm_package` repeats `cpu_temp` — both read `k10temp` `Tctl`. `therm_fan` and `therm_tdp` log `0` on gfx1151, where `amdgpu` exports neither `fan1_input` nor `power1_cap`; the columns stay so existing logs keep their shape.
 
 ## Safety and Reliability
 
@@ -142,15 +142,19 @@ The PID in the filename keeps two concurrent instances from interleaving rows in
 
 **Exit status** — the `EXIT` trap preserves the status the script is exiting with rather than forcing `0`, and a signal exits `128+N`, so a wrapper script can tell a clean quit from an interrupt.
 
-**Graceful degradation** — a missing GPU, `iw`, `systemctl`, or `journalctl` blanks the affected readout instead of failing the run.
+**Graceful degradation** — a missing GPU, `iw`, `systemctl`, or `journalctl` blanks the affected readout instead of failing the run, and a sensor node the driver hides is left out of its panel rather than read as `0`.
 
 **Resize** — `SIGWINCH` re-reads the terminal size and forces a redraw.
 
 ## Troubleshooting
 
-**Exits `3` immediately** — the terminal is below 60x20, `TERM` has no alternate screen, or bash is older than 5.0. The message names which gate failed.
+**Exits `3` immediately** — the terminal is below 60x20, `TERM` has no alternate screen, bash is older than 5.0, or a required tool is missing. The message names which gate failed.
 
-**Everything reads `0` or `?`** — the `k10temp` and `amdgpu` hwmon nodes were not found. Confirm `lm_sensors` is installed and `sensors` reports the sensors by those names.
+**Everything reads `0` or `?`** — the `k10temp` and `amdgpu` hwmon nodes were not found. `sensors` (from `lm_sensors`) lists what the kernel exposes; the names must read `k10temp` and `amdgpu`.
+
+**Overview lines end mid-word** — the terminal is narrower than 80 columns, so each grid panel clips at its edge. Expand the panel (`1`-`6`) for the full line.
+
+**The Thermal panel shows no fan or cap line** — expected on gfx1151, where `amdgpu` hides `fan1_input` and `power1_cap`. The headroom readout is the `PPT` draw against the 85 W BIOS ceiling; the lines appear on a part that exports the nodes.
 
 **Profile counts are yellow after a fresh install** — the units are masked and enabled at deploy but some only settle after a reboot. Reboot, then re-check with [ry-verify](https://github.com/ryanmusante/ry-verify).
 
